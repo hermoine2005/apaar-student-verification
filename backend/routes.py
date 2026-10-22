@@ -5,9 +5,11 @@ from .db import get_db
 from .security import require_actor
 from .audit import utc_now, record_event, verify_chain
 from .duplicates import scan
-from .cases import create_case, transition_case, assign_case, add_evidence, decide_evidence, TRANSITIONS, CASE_STATES
+from .cases import (CaseConflictError, create_case, transition_case, assign_case,
+                    add_evidence, decide_evidence, TRANSITIONS, CASE_STATES)
 from .data_quality import validate_student_record
 from .verification import provider_configuration
+from .source_data import SOURCE_COMPARISON_RULESET_VERSION
 
 api = Blueprint("apaar_api", __name__)
 
@@ -59,6 +61,7 @@ def case_filters(args, institution_id):
     status = str(args.get("case_status", "active")).strip()
     priority = str(args.get("case_priority", "")).strip()
     age = str(args.get("case_age", "")).strip()
+    assignment = str(args.get("case_assignee", "")).strip()
     query = str(args.get("case_q", "")).strip()[:160]
     where, values = " WHERE c.institution_id=?", [institution_id]
     if status == "active":
@@ -79,10 +82,16 @@ def case_filters(args, institution_id):
         values.append(int(age))
     else:
         age = ""
+    if assignment == "assigned":
+        where += " AND COALESCE(c.assigned_to,'')<>''"
+    elif assignment == "unassigned":
+        where += " AND COALESCE(c.assigned_to,'')=''"
+    else:
+        assignment = ""
     if query:
         where += " AND (c.reason LIKE ? OR c.summary LIKE ? OR c.case_type LIKE ?)"
         values.extend([f"%{query}%"] * 3)
-    return where, values, status, priority, age, query
+    return where, values, status, priority, age, query, assignment
 
 def csv_safe(value):
     text = str(value or "")
@@ -97,7 +106,7 @@ def review_queue():
     work_type = request.args.get("work_type", "all").strip()
     if work_type not in {"all", "cases", "duplicates", "quality", "imports"}:
         work_type = "all"
-    case_where, case_args, case_status, case_priority, case_age, case_query = case_filters(
+    case_where, case_args, case_status, case_priority, case_age, case_query, case_assignee = case_filters(
         request.args, g.actor.institution_id)
     candidates = db.execute("""SELECT c.*, a.full_name AS name_a, a.institution_student_id AS code_a,
         a.course AS course_a, a.semester AS semester_a, a.email AS email_a,
@@ -127,9 +136,8 @@ def review_queue():
     ]} for row in candidates]
     active_cases = db.execute("""SELECT c.id,c.case_type,c.status,c.priority,c.created_at,c.reason,
         s.id AS student_id,s.institution_student_id FROM workflow_cases c
-        JOIN students s ON s.id=c.student_id AND s.institution=c.institution_id
-        WHERE c.institution_id=? AND c.status IN ('open','in_review','waiting_for_evidence','escalated')
-        ORDER BY c.updated_at DESC LIMIT 200""", (g.actor.institution_id,)).fetchall()
+        JOIN students s ON s.id=c.student_id AND s.institution=c.institution_id"""
+        + case_where + " ORDER BY c.updated_at DESC LIMIT 200", case_args).fetchall()
     active_case_count = db.execute("""SELECT COUNT(*) FROM workflow_cases WHERE institution_id=?
         AND status IN ('open','in_review','waiting_for_evidence','escalated')""", (g.actor.institution_id,)).fetchone()[0]
     pending_duplicates = [row for row in candidates if row["status"] == "pending_review"]
@@ -204,6 +212,7 @@ def review_queue():
                            case_transition_options=TRANSITIONS,
                            case_status=case_status, case_priority=case_priority,
                            case_age=case_age, case_query=case_query,
+                           case_assignee=case_assignee,
                            work_type=work_type, work_counts=work_counts, work_items=work_items,
                            selected_case_student=request.args.get("case_student", ""),
                            case_age_days=case_age_days,
@@ -281,8 +290,15 @@ def review_case_transition(cid):
     try:
         transition_case(db, case_id=cid, institution_id=g.actor.institution_id,
                         actor_id=g.actor.user_id, role=g.actor.role,
-                        target=target, note=note)
+                        target=target, note=note,
+                        expected_updated_at=data.get("expected_updated_at"))
         db.commit()
+    except CaseConflictError as exc:
+        db.rollback()
+        if request.is_json:
+            return err(str(exc), 409, "case_conflict")
+        flash(str(exc), "error")
+        return redirect(url_for("apaar_api.review_queue") + f"#case-{cid}")
     except (LookupError, ValueError, PermissionError) as exc:
         db.rollback()
         flash(str(exc), "error")
@@ -373,7 +389,10 @@ def student_get(student_id):
             external_provider = {"state": "FAILED", "provider": "unknown", "outcome": "invalid_stored_result",
                 "explanation": "Stored provider result could not be read safely.", "authoritative": False,
                 "manual_review_required": True, "checked_at": latest_run["created_at"]}
-    latest_comparison = get_db().execute("""SELECT c.outcome,c.explanation,c.fields_json,c.dataset_version,c.created_at,d.name
+    latest_comparison = get_db().execute("""SELECT c.outcome,c.explanation,c.fields_json,c.dataset_id,c.dataset_version,
+        c.created_at,c.run_status,c.ruleset_version,c.input_digest,c.result_digest,c.student_updated_at_snapshot,d.name,
+        (SELECT MAX(u.version) FROM institution_source_uploads u
+         WHERE u.dataset_id=c.dataset_id AND u.institution=c.institution AND u.status='committed') AS latest_dataset_version
         FROM institution_source_comparisons c JOIN institution_source_datasets d
           ON d.id=c.dataset_id AND d.institution=c.institution
         WHERE c.institution=? AND c.student_id=? ORDER BY c.created_at DESC,c.id DESC LIMIT 1""",
@@ -383,7 +402,12 @@ def student_get(student_id):
         institution_comparison = {"source": "institution-provided dataset", "dataset_name": latest_comparison["name"],
             "dataset_version": latest_comparison["dataset_version"], "outcome": latest_comparison["outcome"],
             "explanation": latest_comparison["explanation"], "fields": json.loads(latest_comparison["fields_json"] or "{}"),
-            "checked_at": latest_comparison["created_at"], "authoritative": False}
+            "checked_at": latest_comparison["created_at"], "authoritative": False,
+            "run_status": latest_comparison["run_status"], "ruleset_version": latest_comparison["ruleset_version"],
+            "input_digest": latest_comparison["input_digest"], "result_digest": latest_comparison["result_digest"],
+            "stale": (latest_comparison["dataset_version"] != latest_comparison["latest_dataset_version"]
+                      or latest_comparison["student_updated_at_snapshot"] != row["updated_at"]
+                      or latest_comparison["ruleset_version"] != SOURCE_COMPARISON_RULESET_VERSION)}
     return jsonify({
         "id": str(row["id"]), "institution_id": row["institution"],
         "student_code": row["institution_student_id"], "full_name": row["full_name"],
@@ -572,8 +596,12 @@ def cases_transition(cid):
     try:
         transition_case(db, case_id=cid, institution_id=g.actor.institution_id,
                         actor_id=g.actor.user_id, role=g.actor.role,
-                        target=target, note=note)
+                        target=target, note=note,
+                        expected_updated_at=d.get("expected_updated_at"))
         db.commit()
+    except CaseConflictError as exc:
+        db.rollback()
+        return err(str(exc), 409, "case_conflict")
     except LookupError:
         db.rollback()
         return err("Case not found", 404, "not_found")

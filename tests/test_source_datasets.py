@@ -164,6 +164,12 @@ def test_comparison_persists_result_case_audit_and_does_not_change_student(clien
         comparison = db.execute("SELECT * FROM institution_source_comparisons WHERE student_id=?", (student,)).fetchone()
         assert comparison["outcome"] == "MISMATCH"
         assert "differed" in comparison["fields_json"]
+        assert comparison["run_status"] == "completed"
+        assert comparison["ruleset_version"] == "institution-source-comparison-v1"
+        assert len(comparison["input_digest"]) == 64
+        assert len(comparison["result_digest"]) == 64
+        assert json.loads(comparison["outcome_counts_json"]) == {"MISMATCH": 1}
+        assert comparison["student_updated_at_snapshot"] == before[-1]
         after = db.execute("SELECT institution_student_id,full_name,course,semester,status,updated_at FROM students WHERE id=?", (student,)).fetchone()
         assert tuple(after) == before
         assert db.execute("SELECT count(*) FROM workflow_cases WHERE student_id=? AND case_type='institution_source_comparison'", (student,)).fetchone()[0] == 1
@@ -176,6 +182,10 @@ def test_comparison_persists_result_case_audit_and_does_not_change_student(clien
     assert api_student["institution_source_comparison"]["dataset_version"] == 1
     assert api_student["institution_source_comparison"]["outcome"] == "MISMATCH"
     assert api_student["institution_source_comparison"]["authoritative"] is False
+    assert api_student["institution_source_comparison"]["run_status"] == "completed"
+    assert api_student["institution_source_comparison"]["ruleset_version"] == "institution-source-comparison-v1"
+    assert api_student["institution_source_comparison"]["stale"] is False
+    assert "Comparison provenance" in result.get_data(as_text=True)
 
 
 def test_source_versions_show_added_removed_changed_and_unchanged_without_raw_values():
@@ -223,6 +233,13 @@ def test_new_dataset_version_keeps_comparison_on_its_original_version(client):
         assert [row[0] for row in versions] == [1, 2]
         summary = json.loads(versions[1][1])
         assert summary["changed"][0]["fields"] == ["course"]
+        comparison_digest = db.execute("SELECT input_digest FROM institution_source_comparisons WHERE student_id=?", (student,)).fetchone()[0]
+        assert comparison_digest == db.execute("SELECT content_hash FROM institution_source_uploads WHERE id=?", (job1,)).fetchone()[0]
+    stale_detail = client.get(f"/students/{student}")
+    assert b"Stale \xe2\x80\x94 re-run review" in stale_detail.data
+    stale_api = client.get(f"/api/v1/students/{student}").json["institution_source_comparison"]
+    assert stale_api["stale"] is True
+    assert stale_api["dataset_version"] == 1
 
 
 def test_source_dataset_tenant_and_role_isolation_csrf_and_redaction(client):
@@ -233,6 +250,8 @@ def test_source_dataset_tenant_and_role_isolation_csrf_and_redaction(client):
                    ("source-auditor", generate_password_hash("AuditorPass123!"), "auditor", "MITAOE Demo Campus"))
         db.execute("INSERT INTO users(username,password_hash,role,institution,is_active,created_at,updated_at) VALUES(?,?,?,?,1,'now','now')",
                    ("source-other", generate_password_hash("OtherPass123!"), "institution_admin", "Other Synthetic Campus"))
+        db.execute("INSERT INTO users(username,password_hash,role,institution,is_active,created_at,updated_at) VALUES(?,?,?,?,1,'now','now')",
+                   ("source-operator", generate_password_hash("OperatorPass123!"), "operator", "MITAOE Demo Campus"))
     csrf_header = client.environ_base.pop("HTTP_X_CSRF_TOKEN", None)
     no_csrf = client.post(f"/source-datasets/{job_id}/confirm", data={})
     if csrf_header:
@@ -241,6 +260,14 @@ def test_source_dataset_tenant_and_role_isolation_csrf_and_redaction(client):
     auditor = flask_app.test_client()
     login_client(auditor, "source-auditor", "AuditorPass123!")
     assert auditor.get("/source-datasets").status_code in {302, 403}
+    operator = flask_app.test_client()
+    login_client(operator, "source-operator", "OperatorPass123!")
+    assert operator.get("/source-datasets").status_code == 200
+    operator_job, _ = import_source(operator,
+        b"institution_student_id,full_name\nOPERATOR-SYN-1,Operator Synthetic\n", "Operator Dataset")
+    assert confirm_source(operator, operator_job).status_code == 200
+    with sqlite3.connect(app_module.DB_PATH) as db:
+        assert db.execute("SELECT status FROM institution_source_uploads WHERE id=?", (operator_job,)).fetchone()[0] == "committed"
     other = flask_app.test_client()
     login_client(other, "source-other", "OtherPass123!")
     assert other.get(f"/source-datasets?upload_id={job_id}").status_code == 200

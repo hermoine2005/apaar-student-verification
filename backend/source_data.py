@@ -8,13 +8,12 @@ from .data_quality import validate_student_record
 
 MAX_SOURCE_ROWS = 10000
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
+SOURCE_COMPARISON_RULESET_VERSION = "institution-source-comparison-v1"
 REQUIRED_COLUMNS = {"institution_student_id", "full_name"}
 ALLOWED_COLUMNS = REQUIRED_COLUMNS | {
     "course",
     "semester",
     "email",
-    "apaar_id",
-    "notes",
 }
 COMPARE_FIELDS = ("full_name", "course", "semester", "email")
 

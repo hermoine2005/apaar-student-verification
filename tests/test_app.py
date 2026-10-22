@@ -4,6 +4,7 @@ import tempfile
 import io
 from pathlib import Path
 import pytest
+from werkzeug.security import generate_password_hash
 from app import app as flask_app
 import app as app_module
 from conftest import login_client
@@ -51,6 +52,57 @@ def test_dashboard_status_chart_uses_institution_records(client):
     assert f"{pending} records, {percent} percent marked Pending".encode() in response.data
     assert b"Action centre" in response.data
     assert b"Recent import outcomes" in response.data
+
+
+def test_case_allocation_metrics_and_assignment_filters_use_persisted_scoped_cases(client):
+    login(client)
+    first = client.post("/api/v1/verification/cases", json={
+        "student_id": "1", "case_type": "allocation_test",
+        "reason": "Synthetic assigned workload item",
+    })
+    second = client.post("/api/v1/verification/cases", json={
+        "student_id": "1", "case_type": "allocation_test",
+        "reason": "Synthetic unassigned workload item",
+    })
+    assert first.status_code == second.status_code == 201
+    with sqlite3.connect(app_module.DB_PATH) as db:
+        db.execute("UPDATE workflow_cases SET assigned_to='synthetic-verifier' WHERE id=?", (first.json["id"],))
+        assigned, unassigned = db.execute("""SELECT
+            SUM(CASE WHEN COALESCE(assigned_to,'')<>'' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN COALESCE(assigned_to,'')='' THEN 1 ELSE 0 END)
+            FROM workflow_cases WHERE institution_id='MITAOE Demo Campus'
+            AND status IN ('open','in_review','waiting_for_evidence','escalated')""").fetchone()
+    dashboard = client.get("/")
+    assert f">{assigned}</strong>".encode() in dashboard.data
+    assert f">{unassigned}</strong>".encode() in dashboard.data
+    assigned_queue = client.get("/api/v1/review?case_assignee=assigned")
+    unassigned_queue = client.get("/api/v1/review?case_assignee=unassigned")
+    assert f'id="case-{first.json["id"]}"'.encode() in assigned_queue.data
+    assert f'id="case-{second.json["id"]}"'.encode() not in assigned_queue.data
+    assert f'id="case-{second.json["id"]}"'.encode() in unassigned_queue.data
+    assert f'id="case-{first.json["id"]}"'.encode() not in unassigned_queue.data
+
+
+def test_auditor_directory_hides_student_write_action_and_enforces_read_only(client):
+    login(client)
+    with sqlite3.connect(app_module.DB_PATH) as db:
+        db.execute("INSERT INTO users(username,password_hash,role,institution) VALUES(?,?,?,?)", (
+            "directory-auditor", generate_password_hash("AuditorPassword123!"),
+            "auditor", "MITAOE Demo Campus"))
+    auditor = flask_app.test_client()
+    login_client(auditor, "directory-auditor", "AuditorPassword123!")
+    directory = auditor.get("/students")
+    assert directory.status_code == 200
+    assert b"Export CSV" in directory.data
+    assert b">Add student</a>" not in directory.data
+    before = auditor.get("/api/v1/students").json["count"]
+    denied = auditor.post("/students/new", data={
+        "institution_student_id": "AUDITOR-CANNOT-WRITE",
+        "full_name": "Synthetic Read Only Test",
+        "csrf_token": auditor.environ_base["HTTP_X_CSRF_TOKEN"],
+    })
+    assert denied.status_code == 302
+    assert auditor.get("/api/v1/students").json["count"] == before
 
 
 def test_student_detail_shows_actionable_quality_findings(client):
@@ -475,6 +527,9 @@ def test_additive_schema_upgrade_creates_verified_backup_and_preserves_rows(tmp_
             notes TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
         CREATE TABLE verification_cases(id INTEGER PRIMARY KEY, student_id INTEGER NOT NULL, status TEXT NOT NULL,
             summary TEXT NOT NULL, findings TEXT NOT NULL, source TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE institution_source_comparisons(id TEXT PRIMARY KEY,institution TEXT NOT NULL,dataset_id TEXT NOT NULL,
+            dataset_version INTEGER NOT NULL,student_id INTEGER NOT NULL,actor TEXT NOT NULL,outcome TEXT NOT NULL,
+            explanation TEXT NOT NULL,fields_json TEXT NOT NULL,created_at TEXT NOT NULL);
         CREATE TABLE audit_logs(id INTEGER PRIMARY KEY, actor TEXT NOT NULL, action TEXT NOT NULL, entity TEXT NOT NULL,
             entity_id TEXT NOT NULL, details TEXT NOT NULL, created_at TEXT NOT NULL);
         INSERT INTO users(username,password_hash,role) VALUES('admin','hash','admin');
@@ -494,4 +549,7 @@ def test_additive_schema_upgrade_creates_verified_backup_and_preserves_rows(tmp_
     with sqlite3.connect(db_path) as upgraded:
         assert upgraded.execute("SELECT institution_student_id FROM students WHERE id=1").fetchone()[0] == "KEEP-001"
         assert upgraded.execute("SELECT count(*) FROM verification_cases WHERE student_id=1").fetchone()[0] == 1
+        comparison_columns = {row[1] for row in upgraded.execute("PRAGMA table_info(institution_source_comparisons)")}
+        assert {"run_status", "ruleset_version", "input_digest", "result_digest",
+                "student_updated_at_snapshot", "outcome_counts_json"}.issubset(comparison_columns)
         assert upgraded.execute("PRAGMA integrity_check").fetchone()[0] == "ok"

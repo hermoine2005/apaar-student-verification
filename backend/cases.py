@@ -27,6 +27,10 @@ TRANSITIONS = {
 }
 
 
+class CaseConflictError(ValueError):
+    """Raised when a case changed after the caller loaded its current state."""
+
+
 def ensure_case_schema(db):
     columns = {row[1] for row in db.execute("PRAGMA table_info(workflow_cases)")}
     additions = {
@@ -191,7 +195,8 @@ def create_case(db, *, institution_id, student_id, case_type, reason, actor_id,
     return case_id
 
 
-def transition_case(db, *, case_id, institution_id, actor_id, role, target, note):
+def transition_case(db, *, case_id, institution_id, actor_id, role, target, note,
+                    expected_updated_at=None):
     if role not in {"verifier", "institution_admin"}:
         raise PermissionError("Only an authorized reviewer may transition a case")
     case = db.execute(
@@ -200,6 +205,8 @@ def transition_case(db, *, case_id, institution_id, actor_id, role, target, note
     ).fetchone()
     if not case:
         raise LookupError("Case not found")
+    if expected_updated_at and expected_updated_at != case["updated_at"]:
+        raise CaseConflictError("Case changed since it was opened; refresh and review the latest history")
     if target not in TRANSITIONS.get(case["status"], set()):
         raise ValueError("Invalid case status transition")
     note = (note or "").strip()
@@ -210,10 +217,13 @@ def transition_case(db, *, case_id, institution_id, actor_id, role, target, note
     if target in {"resolved", "closed"} and case["assigned_to"] and case["assigned_to"] != actor_id:
         raise PermissionError("Only the assigned reviewer may resolve or close this case")
     timestamp = _now()
-    db.execute("""
+    cursor = db.execute("""
         UPDATE workflow_cases SET status=?,resolution_note=?,reviewer_id=?,decision_at=?,updated_at=?
-        WHERE id=? AND institution_id=?
-    """, (target, note or None, actor_id, timestamp, timestamp, case_id, institution_id))
+        WHERE id=? AND institution_id=? AND status=? AND updated_at=?
+    """, (target, note or None, actor_id, timestamp, timestamp, case_id,
+          institution_id, case["status"], case["updated_at"]))
+    if cursor.rowcount != 1:
+        raise CaseConflictError("Case changed while this action was being saved; refresh and try again")
     db.execute("""
         INSERT INTO case_events
             (case_id,institution_id,actor_id,event_type,from_status,to_status,note,created_at)

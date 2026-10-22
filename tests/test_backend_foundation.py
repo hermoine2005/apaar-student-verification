@@ -526,3 +526,86 @@ def test_case_assignment_is_tenant_scoped_authorized_and_audited(client):
     missing = administrator.post("/api/v1/review/cases/not-a-case/assignment",
                                  data={"assignee": "assigned-reviewer"}, follow_redirects=True)
     assert b"not found" in missing.data.lower()
+
+
+def test_case_transition_rejects_stale_version_without_audit_or_state_change(client):
+    opened = client.post("/api/v1/verification/cases", json={
+        "student_id": "1", "case_type": "concurrency", "reason": "Synthetic concurrency case",
+    })
+    case_id = opened.json["id"]
+    with sqlite3.connect(app_module.DB_PATH) as db:
+        original_version = db.execute(
+            "SELECT updated_at FROM workflow_cases WHERE id=?", (case_id,)
+        ).fetchone()[0]
+
+    first = client.post(f"/api/v1/verification/cases/{case_id}/transition", json={
+        "status": "in_review", "expected_updated_at": original_version,
+    })
+    assert first.status_code == 200
+    with sqlite3.connect(app_module.DB_PATH) as db:
+        events_before = db.execute(
+            "SELECT COUNT(*) FROM case_events WHERE case_id=?", (case_id,)
+        ).fetchone()[0]
+        audits_before = db.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE entity_id=? AND action='verification_case.transitioned'",
+            (case_id,),
+        ).fetchone()[0]
+
+    stale = client.post(f"/api/v1/verification/cases/{case_id}/transition", json={
+        "status": "escalated", "expected_updated_at": original_version,
+    })
+    assert stale.status_code == 409
+    assert stale.json["error"] == "case_conflict"
+    with sqlite3.connect(app_module.DB_PATH) as db:
+        assert db.execute("SELECT status FROM workflow_cases WHERE id=?", (case_id,)).fetchone()[0] == "in_review"
+        assert db.execute("SELECT COUNT(*) FROM case_events WHERE case_id=?", (case_id,)).fetchone()[0] == events_before
+        assert db.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE entity_id=? AND action='verification_case.transitioned'",
+            (case_id,),
+        ).fetchone()[0] == audits_before
+
+
+def test_role_matrix_enforces_read_write_and_tenant_scopes(client):
+    credentials = {
+        "operator": ("matrix-operator", "MatrixOperatorPassword123!"),
+        "verifier": ("matrix-verifier", "MatrixVerifierPassword123!"),
+        "auditor": ("matrix-auditor", "MatrixAuditorPassword123!"),
+        "institution_admin": ("matrix-admin", "MatrixAdminPassword123!"),
+    }
+    with sqlite3.connect(app_module.DB_PATH) as db:
+        for role, (username, password) in credentials.items():
+            db.execute("INSERT INTO users(username,password_hash,role,institution) VALUES(?,?,?,?)", (
+                username, generate_password_hash(password), role, "MITAOE Demo Campus",
+            ))
+        db.execute("INSERT INTO students(institution_student_id,full_name,institution,course,semester,status,created_at,updated_at) "
+                   "VALUES('OTHER-PRIVATE-1','Other Tenant Synthetic','Other Synthetic Campus','Computing','1','Pending','now','now')")
+        other_student_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    for role, (username, password) in credentials.items():
+        actor = flask_app.test_client()
+        login_client(actor, username, password)
+        assert actor.get("/students").status_code == 200, role
+        assert actor.get("/api/v1/students/1").status_code == 200, role
+        assert actor.get(f"/api/v1/students/{other_student_id}").status_code == 404, role
+        assert actor.get("/students/export.csv").status_code == 200, role
+        export = actor.get("/students/export.csv").get_data(as_text=True)
+        assert "Other Tenant Synthetic" not in export, role
+
+        created = actor.post("/api/v1/students", json={
+            "student_code": f"MATRIX-{role}", "full_name": "Synthetic Matrix Student",
+        })
+        assert created.status_code == (403 if role in {"verifier", "auditor"} else 201), role
+
+        case_created = actor.post("/api/v1/verification/cases", json={
+            "student_id": "1", "case_type": "role_matrix", "reason": "Synthetic role matrix case",
+        })
+        assert case_created.status_code == (403 if role == "auditor" else 201), role
+
+        user_admin = actor.post("/admin/users", data={
+            "username": f"escalation-{role}", "password": "SyntheticStrongPassword123!", "role": "verifier",
+            "csrf_token": actor.environ_base["HTTP_X_CSRF_TOKEN"],
+        })
+        assert user_admin.status_code in ({200, 302} if role == "institution_admin" else {302, 403}), role
+        if role != "institution_admin":
+            with sqlite3.connect(app_module.DB_PATH) as db:
+                assert db.execute("SELECT 1 FROM users WHERE username=?", (f"escalation-{role}",)).fetchone() is None

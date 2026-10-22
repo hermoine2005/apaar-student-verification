@@ -10,8 +10,8 @@ Run from the repository root:
 
 | Rows | Parse + validation | Upload + stage | Preview diff + render | Confirm + write | Version diff | Compare service | Compare route + audit |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 1,000 | 0.0153 s | 0.1212 s | 0.0676 s | 0.1754 s | 0.0155 s | 0.0008 s | 0.1536 s |
-| 4,000 | 0.1255 s | 0.2542 s | 0.0735 s | 0.3686 s | 0.0521 s | 0.0040 s | 0.1774 s |
-| 8,000 | 0.2201 s | 0.4317 s | 0.1707 s | 0.4422 s | 0.0955 s | 0.0062 s | 0.1407 s |
+| 1,000 | 0.0158 s | 0.0577 s | 0.0351 s | 0.0359 s | 0.0070 s | 0.0005 s | 0.0258 s |
+| 4,000 | 0.0572 s | 0.0812 s | 0.0373 s | 0.0888 s | 0.0234 s | 0.0018 s | 0.0345 s |
+| 8,000 | 0.1191 s | 0.1697 s | 0.0901 s | 0.1661 s | 0.0485 s | 0.0040 s | 0.0513 s |
 
 These are single-run wall-clock observations on a development machine, not controlled benchmarks or service-level guarantees. Timings include local process and SQLite variability. The configured limits remain 2 MB and 10,000 rows.

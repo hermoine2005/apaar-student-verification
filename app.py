@@ -20,7 +20,8 @@ from backend.audit import record_event
 from backend.cases import create_case
 from backend.data_quality import validate_student_record
 from backend.source_data import (parse_source_csv, compare_student, encode_preview,
-                                 version_diff, MAX_SOURCE_BYTES)
+                                 version_diff, MAX_SOURCE_BYTES,
+                                 SOURCE_COMPARISON_RULESET_VERSION)
 from backend.verification import provider_configuration
 
 try:
@@ -320,6 +321,12 @@ def init_db():
             outcome TEXT NOT NULL,
             explanation TEXT NOT NULL,
             fields_json TEXT NOT NULL,
+            run_status TEXT NOT NULL DEFAULT 'completed',
+            ruleset_version TEXT NOT NULL DEFAULT 'institution-source-comparison-v1',
+            input_digest TEXT NOT NULL DEFAULT '',
+            result_digest TEXT NOT NULL DEFAULT '',
+            student_updated_at_snapshot TEXT NOT NULL DEFAULT '',
+            outcome_counts_json TEXT NOT NULL DEFAULT '{}',
             created_at TEXT NOT NULL,
             FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE RESTRICT,
             FOREIGN KEY(dataset_id) REFERENCES institution_source_datasets(id) ON DELETE RESTRICT
@@ -352,6 +359,18 @@ def init_db():
         source_upload_columns = {row[1] for row in db.execute("PRAGMA table_info(institution_source_uploads)")}
         if "change_summary_json" not in source_upload_columns:
             db.execute("ALTER TABLE institution_source_uploads ADD COLUMN change_summary_json TEXT NOT NULL DEFAULT '{}'")
+        comparison_columns = {row[1] for row in db.execute("PRAGMA table_info(institution_source_comparisons)")}
+        comparison_additions = {
+            "run_status": "TEXT NOT NULL DEFAULT 'completed'",
+            "ruleset_version": "TEXT NOT NULL DEFAULT 'institution-source-comparison-v1'",
+            "input_digest": "TEXT NOT NULL DEFAULT ''",
+            "result_digest": "TEXT NOT NULL DEFAULT ''",
+            "student_updated_at_snapshot": "TEXT NOT NULL DEFAULT ''",
+            "outcome_counts_json": "TEXT NOT NULL DEFAULT '{}'",
+        }
+        for column, declaration in comparison_additions.items():
+            if column not in comparison_columns:
+                db.execute(f"ALTER TABLE institution_source_comparisons ADD COLUMN {column} {declaration}")
 
         admin_exists = db.execute(
             "SELECT id FROM users WHERE username='admin'"
@@ -766,6 +785,13 @@ def dashboard():
         cases_attention = db.execute("""SELECT COUNT(*) FROM workflow_cases
             WHERE institution_id=? AND status IN ('open','in_review','waiting_for_evidence','escalated')""",
             (institution,)).fetchone()[0]
+        assignment_counts = db.execute("""SELECT
+            SUM(CASE WHEN COALESCE(assigned_to,'')<>'' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN COALESCE(assigned_to,'')='' THEN 1 ELSE 0 END)
+            FROM workflow_cases WHERE institution_id=?
+              AND status IN ('open','in_review','waiting_for_evidence','escalated')""",
+            (institution,)).fetchone()
+        assigned_cases, unassigned_cases = (assignment_counts[0] or 0, assignment_counts[1] or 0)
         duplicate_reviews = db.execute("""SELECT COUNT(*) FROM duplicate_candidates
             WHERE institution_id=? AND status='pending_review'""", (institution,)).fetchone()[0]
         pending_imports = db.execute("SELECT COUNT(*) FROM import_jobs WHERE institution=? AND status='preview'", (institution,)).fetchone()[0]
@@ -818,6 +844,8 @@ def dashboard():
         pending=pending,
         review=review,
         cases_attention=cases_attention,
+        assigned_cases=assigned_cases,
+        unassigned_cases=unassigned_cases,
         duplicate_reviews=duplicate_reviews,
         pending_imports=pending_imports,
         quality_issues=quality_issues,
@@ -1050,8 +1078,12 @@ def student_detail(student_id):
         WHERE d.institution=? AND u.version=(SELECT MAX(u2.version) FROM institution_source_uploads u2
           WHERE u2.dataset_id=d.id AND u2.institution=d.institution AND u2.status='committed')
         ORDER BY d.name""", (session.get("institution"),)).fetchall()
-    source_comparisons = db.execute("""SELECT c.*,d.name AS dataset_name FROM institution_source_comparisons c
+    source_comparisons = db.execute("""SELECT c.*,d.name AS dataset_name,s.updated_at AS current_student_updated_at,
+        (SELECT MAX(u.version) FROM institution_source_uploads u
+         WHERE u.dataset_id=c.dataset_id AND u.institution=c.institution AND u.status='committed') AS latest_dataset_version
+        FROM institution_source_comparisons c
         JOIN institution_source_datasets d ON d.id=c.dataset_id AND d.institution=c.institution
+        JOIN students s ON s.id=c.student_id AND s.institution=c.institution
         WHERE c.student_id=? AND c.institution=? ORDER BY c.created_at DESC LIMIT 10""",
         (student_id, session.get("institution"))).fetchall()
 
@@ -1081,7 +1113,12 @@ def student_detail(student_id):
         can_validate=session.get("role") in {"admin", "institution_admin", "operator", "verifier"},
         can_open_case=session.get("role") in {"admin", "institution_admin", "operator", "verifier"},
         source_datasets=source_datasets,
-        source_comparisons=[{**dict(row), "fields": json.loads(row["fields_json"])} for row in source_comparisons],
+        source_comparisons=[{
+            **dict(row), "fields": json.loads(row["fields_json"]),
+            "is_stale": (row["dataset_version"] != row["latest_dataset_version"]
+                         or row["student_updated_at_snapshot"] != row["current_student_updated_at"]
+                         or row["ruleset_version"] != SOURCE_COMPARISON_RULESET_VERSION),
+        } for row in source_comparisons],
         can_compare_source=session.get("role") in {"admin", "institution_admin", "operator", "verifier"},
         provider_configuration=provider_configuration(),
     )
@@ -1093,8 +1130,8 @@ def student_detail(student_id):
 
 @app.route("/source-datasets", methods=["GET", "POST"])
 @login_required
-@role_required("institution_admin")
-@write_role_required("institution_admin")
+@role_required("institution_admin", "operator")
+@write_role_required("institution_admin", "operator")
 def source_datasets():
     institution = session.get("institution", "")
     report = None
@@ -1171,7 +1208,7 @@ def source_datasets():
 
 @app.post("/source-datasets/<upload_id>/confirm")
 @login_required
-@role_required("institution_admin")
+@role_required("institution_admin", "operator")
 def confirm_source_dataset(upload_id):
     institution, stamp = session.get("institution", ""), now()
     db = connect_db()
@@ -1256,7 +1293,7 @@ def compare_institution_source(student_id):
     with connect_db() as db:
         student = db.execute("SELECT * FROM students WHERE id=? AND institution=? AND archived_at IS NULL",
                              (student_id,institution)).fetchone()
-        source = db.execute("""SELECT d.id AS dataset_id,d.name,u.version FROM institution_source_datasets d
+        source = db.execute("""SELECT d.id AS dataset_id,d.name,u.version,u.content_hash FROM institution_source_datasets d
             JOIN institution_source_uploads u ON u.dataset_id=d.id AND u.institution=d.institution AND u.status='committed'
             WHERE d.id=? AND d.institution=? AND u.version=(SELECT MAX(u2.version) FROM institution_source_uploads u2
               WHERE u2.dataset_id=d.id AND u2.institution=d.institution AND u2.status='committed')""",
@@ -1273,18 +1310,35 @@ def compare_institution_source(student_id):
         result = compare_student(dict(student), source_rows, duplicate_candidate=duplicate_candidate)
         comparison_id = secrets.token_hex(16)
         stamp = now()
+        fields_json = json.dumps(result["fields"], sort_keys=True, separators=(",", ":"))
+        outcome_counts_json = json.dumps({result["outcome"]: 1}, sort_keys=True, separators=(",", ":"))
+        provenance = {
+            "dataset_id": source["dataset_id"], "dataset_version": source["version"],
+            "input_digest": source["content_hash"], "ruleset_version": SOURCE_COMPARISON_RULESET_VERSION,
+            "outcome": result["outcome"], "fields": result["fields"],
+            "explanation": result["explanation"],
+        }
+        result_digest = hashlib.sha256(json.dumps(
+            provenance, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")).hexdigest()
         db.execute("""INSERT INTO institution_source_comparisons
-            (id,institution,dataset_id,dataset_version,student_id,actor,outcome,explanation,fields_json,created_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (id,institution,dataset_id,dataset_version,student_id,actor,outcome,explanation,fields_json,
+             run_status,ruleset_version,input_digest,result_digest,student_updated_at_snapshot,outcome_counts_json,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,'completed',?,?,?,?,?,?)""",
             (comparison_id,institution,dataset_id,source["version"],student_id,session.get("username",""),
-             result["outcome"],result["explanation"],json.dumps(result["fields"],sort_keys=True),stamp))
+             result["outcome"],result["explanation"],fields_json,SOURCE_COMPARISON_RULESET_VERSION,
+             source["content_hash"],result_digest,student["updated_at"],outcome_counts_json,stamp))
         db.execute("INSERT INTO audit_logs(institution,actor,action,entity,entity_id,details,created_at) VALUES(?,?,?,?,?,?,?)",
                    (institution,session.get("username",""),"source_comparison","student",str(student_id),
                     f"Compared with institution dataset version {source['version']}; outcome {result['outcome']}; field values omitted.",stamp))
         db.commit()
     workflow_db = get_db()
     record_event(institution, session.get("username"), "source_comparison.completed", "source_comparison",
-                 comparison_id, {"dataset_version": source["version"], "outcome": result["outcome"], "fields": result["fields"]})
+                 comparison_id, {"dataset_id": source["dataset_id"], "dataset_version": source["version"],
+                                 "input_digest": source["content_hash"],
+                                 "ruleset_version": SOURCE_COMPARISON_RULESET_VERSION,
+                                 "run_status": "completed", "result_digest": result_digest,
+                                 "outcome": result["outcome"], "fields": result["fields"]})
     if result["manual_review_required"]:
         try:
             create_case(workflow_db, institution_id=institution, student_id=str(student_id),
