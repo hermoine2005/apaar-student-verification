@@ -454,3 +454,75 @@ def test_student_identifiers_are_omitted_from_audit_metadata(client):
             (str(student_id),),
         ).fetchone()[0]
     assert "PRIVATE-AUDIT-001" not in details
+
+
+def test_case_assignment_is_tenant_scoped_authorized_and_audited(client):
+    from conftest import login_client
+
+    opened = client.post("/api/v1/verification/cases", json={
+        "student_id": "1", "case_type": "source discrepancy",
+        "reason": "Synthetic assignment workflow case",
+    })
+    assert opened.status_code == 201
+    case_id = opened.json["id"]
+    with sqlite3.connect(app_module.DB_PATH) as db:
+        db.execute("INSERT INTO users(username,password_hash,role,institution) VALUES(?,?,?,?)", (
+            "assigned-reviewer", generate_password_hash("ReviewerPassword123!"),
+            "verifier", "MITAOE Demo Campus"))
+        db.execute("INSERT INTO users(username,password_hash,role,institution) VALUES(?,?,?,?)", (
+            "second-reviewer", generate_password_hash("SecondReviewerPassword123!"),
+            "verifier", "MITAOE Demo Campus"))
+        db.execute("INSERT INTO users(username,password_hash,role,institution) VALUES(?,?,?,?)", (
+            "other-tenant-reviewer", generate_password_hash("OtherReviewerPassword123!"),
+            "verifier", "Other Synthetic Campus"))
+
+    csrf_header = client.environ_base.pop("HTTP_X_CSRF_TOKEN")
+    csrf_rejected = client.post(f"/api/v1/review/cases/{case_id}/assignment",
+                                data={"assignee": "assigned-reviewer"})
+    assert csrf_rejected.status_code == 400
+    client.environ_base["HTTP_X_CSRF_TOKEN"] = csrf_header
+    assigned = client.post(f"/api/v1/review/cases/{case_id}/assignment",
+                           data={"assignee": "assigned-reviewer"})
+    assert assigned.status_code == 302
+    with sqlite3.connect(app_module.DB_PATH) as db:
+        assert db.execute("SELECT assigned_to FROM workflow_cases WHERE id=?", (case_id,)).fetchone()[0] == "assigned-reviewer"
+        assert db.execute("SELECT event_type,note FROM case_events WHERE case_id=? ORDER BY id DESC LIMIT 1", (case_id,)).fetchone()[0] == "case.assigned"
+        assert db.execute("SELECT count(*) FROM audit_events WHERE action='case.assigned' AND entity_id=?", (case_id,)).fetchone()[0] == 1
+    assert b"assigned-reviewer" in client.get("/api/v1/review").data
+
+    rejected = client.post(f"/api/v1/review/cases/{case_id}/assignment",
+                           data={"assignee": "other-tenant-reviewer"}, follow_redirects=True)
+    assert b"active verifier in this institution" in rejected.data
+    with sqlite3.connect(app_module.DB_PATH) as db:
+        assert db.execute("SELECT assigned_to FROM workflow_cases WHERE id=?", (case_id,)).fetchone()[0] == "assigned-reviewer"
+    reassigned = client.post(f"/api/v1/review/cases/{case_id}/assignment",
+                             data={"assignee": "second-reviewer"})
+    assert reassigned.status_code == 302
+    with sqlite3.connect(app_module.DB_PATH) as db:
+        assert db.execute("SELECT assigned_to FROM workflow_cases WHERE id=?", (case_id,)).fetchone()[0] == "second-reviewer"
+        assert db.execute("SELECT count(*) FROM case_events WHERE case_id=? AND event_type IN ('case.assigned','case.reassigned')", (case_id,)).fetchone()[0] == 2
+
+    verifier = flask_app.test_client()
+    login_client(verifier, "assigned-reviewer", "ReviewerPassword123!")
+    forbidden = verifier.post(f"/api/v1/review/cases/{case_id}/assignment",
+                              data={"assignee": "assigned-reviewer"})
+    assert forbidden.status_code == 403
+
+    verifier.post(f"/api/v1/verification/cases/{case_id}/transition",
+                  json={"status": "in_review", "note": "Started independent review"})
+    wrong_reviewer = verifier.post(f"/api/v1/verification/cases/{case_id}/transition",
+                                   json={"status": "resolved", "note": "Resolved by a non-assignee"})
+    assert wrong_reviewer.status_code == 403
+    assigned_client = flask_app.test_client()
+    login_client(assigned_client, "second-reviewer", "SecondReviewerPassword123!")
+    resolved = assigned_client.post(f"/api/v1/verification/cases/{case_id}/transition",
+                                    json={"status": "resolved", "note": "Reviewed and corrected synthetic mismatch"})
+    assert resolved.status_code == 200
+    with sqlite3.connect(app_module.DB_PATH) as db:
+        assert db.execute("SELECT status,reviewer_id FROM workflow_cases WHERE id=?", (case_id,)).fetchone() == ("resolved", "second-reviewer")
+
+    administrator = flask_app.test_client()
+    login_client(administrator)
+    missing = administrator.post("/api/v1/review/cases/not-a-case/assignment",
+                                 data={"assignee": "assigned-reviewer"}, follow_redirects=True)
+    assert b"not found" in missing.data.lower()

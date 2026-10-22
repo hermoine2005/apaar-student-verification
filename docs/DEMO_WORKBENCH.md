@@ -7,7 +7,7 @@ This rehearsal uses a separate SQLite file. It does not overwrite or point to `i
 In PowerShell from the repository root:
 
 ```powershell
-$demoPath = Join-Path (Resolve-Path 'instance').Path 'apaar-workbench-demo.db'
+$demoPath = Join-Path $env:TEMP ('apaar-workbench-demo-' + [guid]::NewGuid().ToString('N') + '.db')
 if (Test-Path -LiteralPath $demoPath) { throw 'Choose a new database filename; existing demo data is preserved.' }
 $env:APAAR_DB_PATH = $demoPath
 $env:SECRET_KEY = [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')
@@ -25,7 +25,7 @@ The first start initializes this new database and inserts the application's four
 2. Open **Students > Add student**. Create a synthetic profile with a unique institutional ID, a name similar to one seeded profile, and leave course/semester blank. The record summary shows quality findings and a direct route to open a case.
 3. Open **Review queue** and select **Run duplicate scan**. Review the candidate signals and compare the linked records. A reviewer records a decision and reason; no records are merged.
 4. Use the record summary to open a case for the incomplete record. The form preselects that student. The case appears in the central actionable-work list and its timeline.
-5. To demonstrate reviewer separation, use **Users & access** to create a verifier account with a strong local password. Sign out, sign in as that reviewer, and move the case through `in_review` to `resolved` with a reason. The person who created the case cannot resolve it.
+5. To demonstrate assignment and reviewer separation, use **Users & access** to create a verifier account with a strong local password. In the **Reviewer assignment** section of the Review queue, assign the active case to that verifier. Sign out, sign in as that reviewer, and move the case through `in_review` to `resolved` with a reason. Assignment appears in the case timeline and audit history; the person who created the case cannot resolve it.
 6. Open the student detail again. The internal case state, quality findings, duplicate review, and case activity links are grouped in the record summary.
 7. Open **Audit history** and verify the case activity. Use **Download filtered case CSV** in Review queue to demonstrate a tenant-scoped report that excludes student names and codes.
 8. For the import path, open **Import records** and preview `static/sample_students.csv`. The preview clearly says it has not written records. Confirm it, then use its links to reach the student directory and review workbench.

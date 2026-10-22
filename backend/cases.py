@@ -207,6 +207,8 @@ def transition_case(db, *, case_id, institution_id, actor_id, role, target, note
         raise ValueError("A resolution or closure note of 8–1000 characters is required")
     if target in {"resolved", "closed"} and case["created_by"] == actor_id:
         raise PermissionError("A different reviewer must resolve or close the case")
+    if target in {"resolved", "closed"} and case["assigned_to"] and case["assigned_to"] != actor_id:
+        raise PermissionError("Only the assigned reviewer may resolve or close this case")
     timestamp = _now()
     db.execute("""
         UPDATE workflow_cases SET status=?,resolution_note=?,reviewer_id=?,decision_at=?,updated_at=?
@@ -221,6 +223,49 @@ def transition_case(db, *, case_id, institution_id, actor_id, role, target, note
                  "verification_case", case_id,
                  {"from": case["status"], "to": target}, note)
     return case
+
+
+def assign_case(db, *, case_id, institution_id, actor_id, role, assignee):
+    """Assign an institution case to an active reviewer and preserve history."""
+    if role != "institution_admin":
+        raise PermissionError("Only an institution administrator may assign cases")
+    assignee = (assignee or "").strip()
+    if len(assignee) > 80:
+        raise ValueError("Reviewer selection is invalid")
+    case = db.execute(
+        "SELECT id,assigned_to,status FROM workflow_cases WHERE id=? AND institution_id=?",
+        (case_id, institution_id),
+    ).fetchone()
+    if not case:
+        raise LookupError("Case not found")
+    if case["status"] in {"resolved", "closed", "recorded"}:
+        raise ValueError("Completed cases cannot be assigned")
+    if assignee:
+        reviewer = db.execute(
+            "SELECT username FROM users WHERE username=? AND institution=? AND role='verifier' AND is_active=1",
+            (assignee, institution_id),
+        ).fetchone()
+        if not reviewer:
+            raise ValueError("Select an active verifier in this institution")
+    previous = case["assigned_to"] or ""
+    if previous == assignee:
+        raise ValueError("Case is already assigned to that reviewer")
+    timestamp = _now()
+    cursor = db.execute(
+        "UPDATE workflow_cases SET assigned_to=?,updated_at=? WHERE id=? AND institution_id=? AND COALESCE(assigned_to,'')=? AND status NOT IN ('resolved','closed','recorded')",
+        (assignee or None, timestamp, case_id, institution_id, previous),
+    )
+    if cursor.rowcount != 1:
+        raise ValueError("Case assignment changed; refresh the queue and try again")
+    action = "case.unassigned" if not assignee else ("case.assigned" if not previous else "case.reassigned")
+    note = f"{previous or 'Unassigned'} -> {assignee or 'Unassigned'}"
+    db.execute("""INSERT INTO case_events
+        (case_id,institution_id,actor_id,event_type,note,created_at)
+        VALUES(?,?,?,?,?,?)""", (case_id, institution_id, actor_id, action, note, timestamp))
+    _record_event(institution_id, actor_id, action, "verification_case", case_id,
+                  {"previous_assignee": previous or None, "assignee": assignee or None})
+    return {"case_id": case_id, "previous_assignee": previous or None,
+            "assignee": assignee or None, "action": action, "created_at": timestamp}
 
 
 def add_evidence(db, *, case_id, institution_id, actor_id, evidence_type,

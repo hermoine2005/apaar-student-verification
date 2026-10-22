@@ -5,7 +5,7 @@ from .db import get_db
 from .security import require_actor
 from .audit import utc_now, record_event, verify_chain
 from .duplicates import scan
-from .cases import create_case, transition_case, add_evidence, decide_evidence, TRANSITIONS, CASE_STATES
+from .cases import create_case, transition_case, assign_case, add_evidence, decide_evidence, TRANSITIONS, CASE_STATES
 from .data_quality import validate_student_record
 from .verification import provider_configuration
 
@@ -193,9 +193,15 @@ def review_queue():
         ).fetchall()
     students = db.execute("SELECT id,full_name,institution_student_id FROM students WHERE institution=? AND archived_at IS NULL ORDER BY full_name LIMIT 500",
         (g.actor.institution_id,)).fetchall()
+    reviewers = db.execute("SELECT username FROM users WHERE institution=? AND role='verifier' AND is_active=1 ORDER BY username LIMIT 100",
+        (g.actor.institution_id,)).fetchall()
+    reviewer_workload = db.execute("SELECT assigned_to,COUNT(*) AS count FROM workflow_cases WHERE institution_id=? AND assigned_to IS NOT NULL AND status IN ('open','in_review','waiting_for_evidence','escalated') GROUP BY assigned_to",
+        (g.actor.institution_id,)).fetchall()
     return render_template("review.html", candidates=candidates, cases=cases,
                            case_events=case_events, case_audit_events=case_audit_events, case_evidence=case_evidence,
-                           students=students, case_transition_options=TRANSITIONS,
+                           students=students, reviewers=reviewers,
+                           reviewer_workload={row["assigned_to"]: row["count"] for row in reviewer_workload},
+                           case_transition_options=TRANSITIONS,
                            case_status=case_status, case_priority=case_priority,
                            case_age=case_age, case_query=case_query,
                            work_type=work_type, work_counts=work_counts, work_items=work_items,
@@ -283,6 +289,40 @@ def review_case_transition(cid):
         return redirect(url_for("apaar_api.review_queue"))
     flash("Case status updated.", "success")
     return redirect(url_for("apaar_api.review_queue"))
+
+
+@api.post("/review/cases/<cid>/assignment")
+@require_actor("institution_admin")
+def review_case_assignment(cid):
+    data = payload()
+    db = get_db()
+    try:
+        result = assign_case(db, case_id=cid, institution_id=g.actor.institution_id,
+                             actor_id=g.actor.user_id, role=g.actor.role,
+                             assignee=str(data.get("assignee") or ""))
+        db.commit()
+    except LookupError:
+        db.rollback()
+        if request.is_json:
+            return err("Case not found", 404, "not_found")
+        flash("Case was not found in this institution.", "error")
+        return redirect(url_for("apaar_api.review_queue"))
+    except PermissionError as exc:
+        db.rollback()
+        if request.is_json:
+            return err(str(exc), 403, "forbidden")
+        flash(str(exc), "error")
+        return redirect(url_for("apaar_api.review_queue"))
+    except ValueError as exc:
+        db.rollback()
+        if request.is_json:
+            return err(str(exc))
+        flash(str(exc), "error")
+        return redirect(url_for("apaar_api.review_queue"))
+    if request.is_json:
+        return jsonify(result)
+    flash("Case assignment saved and added to the audit timeline.", "success")
+    return redirect(url_for("apaar_api.review_queue") + f"#case-{cid}")
 
 @api.post("/duplicates/scan")
 @require_actor("operator", "institution_admin")

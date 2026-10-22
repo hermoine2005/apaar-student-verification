@@ -1,0 +1,3 @@
+institution_student_id,full_name,institution,course,semester,apaar_id,email,notes
+DEMO-2001,Meera Joshi,Demo College,Computer Engineering,2,DEMO-APAAR-2001,meera@example.test,Synthetic example
+DEMO-2002,Kabir Deshmukh,Demo College,Information Technology,1,DEMO-APAAR-2002,kabir@example.test,Synthetic example

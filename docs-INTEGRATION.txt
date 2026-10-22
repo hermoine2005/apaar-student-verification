@@ -1,0 +1,3 @@
+INTEGRATION NOTES
+
+The ZIP contains only application source and configuration. It does not include .git, .venv, local database files, or credentials. Extract into the existing project root only after backing up/committing current work. The included INTEGRATE_UPDATE.cmd can perform the extraction after confirmation.
