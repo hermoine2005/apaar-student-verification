@@ -1,5 +1,7 @@
 # APAAR Student Data Management & Verification Platform
 
+> Historical architecture proposal. Its React/Express/PostgreSQL setup instructions describe an unimplemented target and are not the runnable application. Use the root [README](README.md) for the canonical Flask + SQLite setup and commands.
+
 **SIH 2026 | Problem Statement: SIH26263 | Software Category**
 
 > A privacy-conscious, interoperable platform for managing student academic records, validating data quality, detecting inconsistencies, and supporting authorized academic record verification.
@@ -1457,3 +1459,23 @@ Consult the current official documentation and relevant approvals before impleme
 ---
 
 **Project status:** Initial development specification. Features, architecture, integrations, and deployment options described here are proposed and should not be interpreted as already implemented or approved for production use.
+# Active Flask implementation supplement (2026-10)
+
+The executable application in this repository is the root `app.py` Flask/Jinja app and its `/api/v1` blueprint in `backend/routes.py`. The earlier sections below describe the target architecture and contain illustrative TypeScript interfaces; those are requirements, not proof of deployed integrations. The disconnected `apaar-platform-upgrade/` prototype is not part of startup.
+
+## Local verification behavior
+
+The active app now stores verification runs in `verification_runs` and per-rule outcomes in `verification_rule_results`. The deterministic rule set is `local-rules-1.0`; rule output includes result, explanation, severity, internal field evidence references, and review flags. The supported status vocabulary is `Draft`, `Pending verification`, `In progress`, `Verified against source`, `Demo-validated`, `Needs review`, `Discrepancy detected`, `Failed to verify`, `Expired or stale`, and `Cancelled`. UI/API student edits cannot set status directly. Legacy `Verified` rows are conservatively changed to `Needs review` and a migration entry is recorded; they are never upgraded to authoritative status.
+
+To run the synthetic provider locally, set `APAAR_PROVIDER=mock` and optionally `APAAR_MOCK_SCENARIO=matched` before starting `python app.py`. The student detail verification form allows the deterministic scenarios `matched`, `not_found`, `mismatch`, `inconclusive`, `unavailable`, `unauthorized`, `malformed`, and `stale`. With no provider configured, the persisted provider state is `NOT_CONFIGURED`, the UI says external verification is unavailable, and the overall status is `Needs review`; it is not described as a provider failure or identity mismatch. Mock runs have provider state `SIMULATED`, retain synthetic fixture references only, and can never set `Verified against source`. In production mode, the mock provider is disabled unless `APAAR_ALLOW_MOCK_PROVIDER=1` is explicitly set. The project has no authoritative APAAR, ABC, DigiLocker, or other government adapter, credentials, approval, or live access.
+
+Institution source data is managed through the separate `/source-datasets` screen and `institution_source_*` tables. CSV versions are immutable; the preview and history show added, removed, changed, and unchanged record counts, with changed field names and masked record suffixes only. Each comparison remains bound to its source dataset version. Student-comparison outcomes are institution-provided data comparisons, never official identity verification. CSV is the only supported source upload format; uploaded SQLite databases or filesystem paths are rejected.
+
+Student APIs and CSV exports omit the APAAR identifier. The profile shows only a masked suffix; the edit form accepts the identifier in a password field and preserves the stored value when left blank. This is redaction and role/institution access control, not encryption at rest. Existing CSV preview/confirmation and transaction behavior remains in the Flask app.
+
+## Remaining implementation limitations
+
+- `Verified against source` is reserved in the status model and transition validator but intentionally cannot be produced by any configured provider in this repository. A separately approved, authenticated authoritative adapter with response validation and provenance is required before that state can be enabled.
+- Mock provider scenarios are deterministic fixtures selected by scenario name, not a connection to an external or official dataset.
+- Existing local database startup performs additive table initialization and conservatively normalizes ambiguous legacy status labels after taking the existing pre-upgrade snapshot when needed. Test this only with a disposable database; protected demo/legacy database files are not test targets.
+- SQLite and the demo authentication setup are for a local synthetic demonstration, not production deployment. No claim of encryption at rest, regulatory certification, or official identity verification is made.

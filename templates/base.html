@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+ <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+ <title>{% block title %}APAAR Verify{% endblock %} | Student Data Platform</title>
+ <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+ <link rel="stylesheet" href="{{ url_for('static', filename='review.css') }}">
+</head>
+<body>
+{% if session.get('username') %}
+<div class="shell">
+ <aside class="sidebar">
+ <a class="brand" href="{{ url_for('dashboard') }}"><span class="brand-mark">A</span><span><strong>APAAR Verify</strong><small>Student data platform</small></span></a>
+ <div class="nav-label">WORKSPACE</div>
+ <a class="nav-link {% if request.endpoint=='apaar_api.review_queue' %}active{% endif %}" href="{{ url_for('apaar_api.review_queue') }}"><span>Review queue</span></a>
+ <a class="nav-link {% if request.endpoint=='dashboard' %}active{% endif %}" href="{{ url_for('dashboard') }}"> <span>Overview</span></a>
+ <a class="nav-link {% if request.endpoint in ['students','student_form','student_detail'] %}active{% endif %}" href="{{ url_for('students') }}"> <span>Students</span></a>
+ <a class="nav-link {% if request.endpoint=='imports' %}active{% endif %}" href="{{ url_for('imports') }}"> <span>Import records</span></a>
+ {% if session.get('role') in ['admin','institution_admin'] %}<a class="nav-link {% if request.endpoint=='source_datasets' %}active{% endif %}" href="{{ url_for('source_datasets') }}"><span>Institution source data</span></a>{% endif %}
+ <a class="nav-link {% if request.endpoint=='audit_page' %}active{% endif %}" href="{{ url_for('audit_page') }}"> <span>Audit history</span></a>
+ {% if session.get('role') in ['admin','institution_admin'] %}<a class="nav-link {% if request.endpoint=='admin_users' %}active{% endif %}" href="{{ url_for('admin_users') }}"><span>Users &amp; access</span></a>{% endif %}
+ {% if session.get('role') in ['admin','institution_admin'] %}<a class="nav-link" href="{{ url_for('archived_students') }}"><span>Archived records</span></a>{% endif %}
+ <div class="sidebar-bottom"><div class="demo-note"><strong>Demo environment</strong><p>Synthetic data | No official APAAR connection</p></div><div class="user-row"><span class="avatar">{{ session.get('username','U')[0]|upper }}</span><div><strong>{{ session.get('username') }}</strong><small>Application user</small></div><form method="post" action="{{ url_for('logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="logout" title="Log out">Log out</button></form></div></div>
+ </aside>
+ <main class="main">
+ <header class="topbar"><div><span class="eyebrow">SIH 2026 | SIH26263</span><strong>Student Data Management &amp; Verification</strong></div><span class="demo-pill"><i></i> Prototype mode</span></header>
+ <section class="content">
+ {% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}<div class="flashes">{% for category,message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}</div>{% endif %}{% endwith %}
+ {% block content %}{% endblock %}
+ <footer>APAAR Student Data Platform <span>Prototype | Synthetic records only {{ current_year }}</span></footer>
+ </section>
+ </main>
+</div>
+{% else %}
+{% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}<div class="login-flashes">{% for category,message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}</div>{% endif %}{% endwith %}
+{% block public_content %}{% endblock %}
+{% endif %}
+</body></html>

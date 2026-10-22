@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Archived students{% endblock %}
+{% block content %}
+<div class="page-heading"><div><span class="eyebrow">RECORD RECOVERY</span><h1>Archived students</h1><p>Restore a record with its original internal ID and linked history.</p></div><a class="btn secondary" href="{{ url_for('students') }}">Student directory</a></div>
+<div class="panel table-panel"><div class="table-wrap"><table><thead><tr><th>Student</th><th>Institutional ID</th><th>Archived</th><th>Restore</th></tr></thead><tbody>
+{% for student in students %}<tr><td><strong>{{ student.full_name }}</strong><br><small>Internal record #{{ student.id }}</small></td><td class="mono">{{ student.institution_student_id }}</td><td>{{ student.archived_at[:19].replace('T',' ') }} UTC</td><td><form method="post" action="{{ url_for('student_restore',student_id=student.id) }}" class="restore-form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><label>Replacement ID if the old ID is in use<input name="institution_student_id" maxlength="80" placeholder="Leave blank to keep existing"></label><button class="btn secondary" type="submit">Restore record</button></form></td></tr>
+{% else %}<tr><td colspan="4" class="empty">No archived records are available for this institution.</td></tr>{% endfor %}
+</tbody></table></div></div>
+{% endblock %}
