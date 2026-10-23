@@ -1,4 +1,4 @@
-﻿import csv
+import csv
 import hashlib
 import io
 import json
@@ -45,12 +45,26 @@ DB_PATH = os.environ.get(
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 app = Flask(__name__)
-configured_secret = os.environ.get("SECRET_KEY", "").strip()
-if configured_secret in {"", "replace-with-a-long-random-secret", "development-only-change-me"}:
-    if os.environ.get("FLASK_ENV") == "production":
-        raise RuntimeError("Set a private SECRET_KEY before starting in production mode")
-    configured_secret = os.urandom(32).hex()
-app.secret_key = configured_secret
+def resolve_secret_key(value, production=False):
+    """Reject documented placeholders and generate only a local-dev fallback."""
+    candidate = (value or "").strip()
+    is_placeholder = (
+        not candidate
+        or candidate.lower().startswith("replace-with-")
+        or candidate == "development-only-change-me"
+    )
+    if is_placeholder:
+        if production:
+            raise RuntimeError("Set a private SECRET_KEY before starting in production mode")
+        return secrets.token_hex(32)
+    return candidate
+
+
+production_mode = (
+    os.environ.get("APP_ENV", "").strip().lower() == "production"
+    or os.environ.get("FLASK_ENV", "").strip().lower() == "production"
+)
+app.secret_key = resolve_secret_key(os.environ.get("SECRET_KEY", ""), production=production_mode)
 app.config["APAAR_DB_PATH"] = DB_PATH
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
@@ -88,7 +102,7 @@ def backup_before_schema_upgrade():
         )}
         if not tables:
             return
-        required_tables = {"users", "audit_logs", "workflow_cases", "duplicate_candidates", "audit_events", "import_jobs", "import_job_rows", "case_events", "case_evidence", "verification_runs", "verification_rule_results", "app_migrations", "institution_source_datasets", "institution_source_uploads", "institution_source_records", "institution_source_comparisons"}
+        required_tables = {"users", "audit_logs", "workflow_cases", "duplicate_candidates", "audit_events", "import_jobs", "import_job_rows", "case_events", "case_evidence", "verification_runs", "verification_rule_results", "app_migrations", "institution_source_datasets", "institution_source_uploads", "institution_source_records", "institution_source_comparisons", "programmes", "intake_allocations", "enrolments", "enrolment_submissions", "data_use_authorizations"}
         missing_tables = required_tables - tables
         needs_upgrade = bool(missing_tables)
         triggers = {row[0] for row in source.execute(
@@ -106,6 +120,9 @@ def backup_before_schema_upgrade():
         if "students" in tables:
             student_columns = {row[1] for row in source.execute("PRAGMA table_info(students)")}
             needs_upgrade = needs_upgrade or "archived_at" not in student_columns
+        if "enrolment_submissions" in tables:
+            submission_columns = {row[1] for row in source.execute("PRAGMA table_info(enrolment_submissions)")}
+            needs_upgrade = needs_upgrade or "authorization_id" not in submission_columns
         if "institution_source_uploads" in tables:
             source_columns = {row[1] for row in source.execute("PRAGMA table_info(institution_source_uploads)")}
             needs_upgrade = needs_upgrade or "change_summary_json" not in source_columns
@@ -171,10 +188,27 @@ def spreadsheet_safe(value):
     return text
 
 
+class ClosingSQLiteConnection(sqlite3.Connection):
+    """Commit/rollback on context exit and always release the SQLite handle.
+
+    sqlite3's built-in connection context manager does not close the connection.
+    Most routes use ``with connect_db()``; closing here avoids accumulating open
+    handles and reduces file-lock surprises on Windows. Explicitly managed
+    connections continue to work and can still call ``close()`` themselves.
+    """
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def connect_db():
-    db = sqlite3.connect(DB_PATH)
+    db = sqlite3.connect(DB_PATH, factory=ClosingSQLiteConnection, timeout=15)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys=ON")
+    db.execute("PRAGMA busy_timeout=15000")
     return db
 
 
@@ -268,6 +302,84 @@ def init_db():
             FOREIGN KEY(job_id) REFERENCES import_jobs(id) ON DELETE CASCADE,
             UNIQUE(job_id, row_number)
         );
+
+        CREATE TABLE IF NOT EXISTS programmes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            institution TEXT NOT NULL,
+            code TEXT NOT NULL,
+            name TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(institution, code)
+        );
+
+        CREATE TABLE IF NOT EXISTS intake_allocations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            institution TEXT NOT NULL,
+            programme_id INTEGER NOT NULL,
+            intake_year INTEGER NOT NULL,
+            capacity INTEGER NOT NULL CHECK(capacity > 0),
+            status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('draft','open','closed')),
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(institution, programme_id, intake_year),
+            FOREIGN KEY(programme_id) REFERENCES programmes(id) ON DELETE RESTRICT
+        );
+
+        CREATE TABLE IF NOT EXISTS enrolments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            institution TEXT NOT NULL,
+            student_id INTEGER NOT NULL,
+            allocation_id INTEGER NOT NULL,
+            institutional_enrolment_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','submitted','under_review','approved','rejected','withdrawn','returned_for_correction')),
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(institution, institutional_enrolment_id),
+            UNIQUE(student_id, allocation_id),
+            FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE RESTRICT,
+            FOREIGN KEY(allocation_id) REFERENCES intake_allocations(id) ON DELETE RESTRICT
+        );
+        CREATE INDEX IF NOT EXISTS idx_enrolments_institution_status ON enrolments(institution,status,updated_at);
+
+        CREATE TABLE IF NOT EXISTS enrolment_submissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            institution TEXT NOT NULL,
+            enrolment_id INTEGER NOT NULL,
+            version INTEGER NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('submitted','under_review','approved','rejected','returned_for_correction')),
+            submitted_by TEXT NOT NULL,
+            submitted_at TEXT NOT NULL,
+            reviewed_by TEXT,
+            reviewed_at TEXT,
+            review_note TEXT NOT NULL DEFAULT '',
+            authorization_id INTEGER REFERENCES data_use_authorizations(id) ON DELETE RESTRICT,
+            UNIQUE(enrolment_id, version),
+            FOREIGN KEY(enrolment_id) REFERENCES enrolments(id) ON DELETE RESTRICT
+        );
+
+        CREATE TABLE IF NOT EXISTS data_use_authorizations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            institution TEXT NOT NULL,
+            student_id INTEGER NOT NULL,
+            purpose TEXT NOT NULL CHECK(purpose IN ('admissions_submission','verification_review','source_comparison')),
+            authority_basis TEXT NOT NULL CHECK(authority_basis IN ('consent','guardian_authorization','statutory_authority','institutional_policy','other_authority')),
+            data_categories_json TEXT NOT NULL,
+            evidence_reference TEXT NOT NULL DEFAULT '',
+            note TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','withdrawn')),
+            valid_until TEXT,
+            recorded_by TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            withdrawn_by TEXT,
+            withdrawn_at TEXT,
+            FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE RESTRICT
+        );
+        CREATE INDEX IF NOT EXISTS idx_data_use_authorizations_student
+            ON data_use_authorizations(institution, student_id, purpose, recorded_at DESC);
 
         CREATE TABLE IF NOT EXISTS institution_source_datasets (
             id TEXT PRIMARY KEY,
@@ -393,16 +505,24 @@ def init_db():
         for column, declaration in comparison_additions.items():
             if column not in comparison_columns:
                 db.execute(f"ALTER TABLE institution_source_comparisons ADD COLUMN {column} {declaration}")
+        submission_columns = {row[1] for row in db.execute("PRAGMA table_info(enrolment_submissions)")}
+        if "authorization_id" not in submission_columns:
+            db.execute("ALTER TABLE enrolment_submissions ADD COLUMN authorization_id INTEGER REFERENCES data_use_authorizations(id) ON DELETE RESTRICT")
 
         admin_exists = db.execute(
             "SELECT id FROM users WHERE username='admin'"
         ).fetchone()
         if not admin_exists:
             admin_password = os.environ.get("DEMO_ADMIN_PASSWORD", "")
-            if os.environ.get("FLASK_ENV") == "production" and len(admin_password) < 16:
-                raise RuntimeError("Set a private DEMO_ADMIN_PASSWORD of at least 16 characters before initializing the production admin")
-            if not admin_password:
-                admin_password = "ChangeMe123!"
+            if (not admin_password
+                    or admin_password.startswith("replace-with-")):
+                raise RuntimeError(
+                    "Set DEMO_ADMIN_PASSWORD in your private .env before initializing the first admin"
+                )
+            if os.environ.get("FLASK_ENV", "").strip().lower() == "production" and len(admin_password) < 16:
+                raise RuntimeError(
+                    "Set a private DEMO_ADMIN_PASSWORD of at least 16 characters before initializing the production admin"
+                )
             db.execute(
                 "INSERT INTO users(username,password_hash,role,institution,is_active,created_at,updated_at,email) VALUES(?,?,?,?,1,?,?,?)",
                 (
@@ -475,6 +595,11 @@ def init_db():
                 (legacy["institution"], f"Normalized {legacy['count']} legacy status labels; ambiguous Verified mapped to Needs review.", now()))
 
         db.commit()
+
+    # Migrate the legacy global student-code constraint to institution scope.
+    from backend.migrations import migrate_student_identifier_scope, migrate_admissions_workflow_schema
+    migrate_student_identifier_scope(DB_PATH)
+    migrate_admissions_workflow_schema(DB_PATH)
 
     # The website verification table is created above. Run the idempotent
     # bridge after both schemas exist so website-only startup also completes it.
@@ -1287,8 +1412,8 @@ def student_form(student_id=None):
             )
 
         with connect_db() as db:
-            duplicate_code = db.execute("SELECT 1 FROM students WHERE lower(institution_student_id)=lower(?) AND id<>COALESCE(?, -1)",
-                (values["institution_student_id"], student_id)).fetchone() is not None
+            duplicate_code = db.execute("SELECT 1 FROM students WHERE lower(trim(institution))=lower(trim(?)) AND lower(trim(institution_student_id))=lower(trim(?)) AND id<>COALESCE(?, -1)",
+                (values["institution"], values["institution_student_id"], student_id)).fetchone() is not None
         field_issues = validate_student_record(values, duplicate_code=duplicate_code)
         field_errors = [issue for issue in field_issues if issue["severity"] == "error"]
         if field_errors:
@@ -1354,6 +1479,99 @@ def student_form(student_id=None):
 
 
 # ---------------------------------------------------------
+# Purpose-limited data-use authorization register
+# ---------------------------------------------------------
+
+AUTHORIZATION_PURPOSES = {"admissions_submission", "verification_review", "source_comparison"}
+AUTHORIZATION_BASES = {"consent", "guardian_authorization", "statutory_authority", "institutional_policy", "other_authority"}
+AUTHORIZATION_CATEGORIES = {"identity", "academic_record", "contact_details", "admissions_record"}
+
+
+@app.route("/students/<int:student_id>/authorizations", methods=["POST"])
+@login_required
+@role_required("institution_admin", "operator")
+@write_role_required("institution_admin", "operator")
+def authorization_create(student_id):
+    institution = session.get("institution", "")
+    purpose = request.form.get("purpose", "").strip()
+    basis = request.form.get("authority_basis", "").strip()
+    categories = sorted(set(request.form.getlist("data_categories")))
+    evidence_reference = request.form.get("evidence_reference", "").strip()[:128]
+    note = request.form.get("note", "").strip()[:500]
+    valid_until = request.form.get("valid_until", "").strip() or None
+    if purpose not in AUTHORIZATION_PURPOSES or basis not in AUTHORIZATION_BASES:
+        flash("Choose a supported purpose and authority basis.", "error")
+        return redirect(url_for("student_detail", student_id=student_id))
+    if not categories or any(category not in AUTHORIZATION_CATEGORIES for category in categories):
+        flash("Select at least one supported data category.", "error")
+        return redirect(url_for("student_detail", student_id=student_id))
+    if valid_until:
+        try:
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", valid_until):
+                raise ValueError
+            datetime.strptime(valid_until, "%Y-%m-%d")
+        except ValueError:
+            flash("Expiry must be a valid date in YYYY-MM-DD format.", "error")
+            return redirect(url_for("student_detail", student_id=student_id))
+    try:
+        with connect_db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            student = db.execute("SELECT id FROM students WHERE id=? AND institution=? AND archived_at IS NULL", (student_id, institution)).fetchone()
+            if not student:
+                db.rollback()
+                abort(404)
+            effective = db.execute("""SELECT id FROM data_use_authorizations
+                WHERE institution=? AND student_id=? AND purpose=? AND status='active'
+                  AND (valid_until IS NULL OR valid_until>=?) LIMIT 1""",
+                (institution, student_id, purpose, datetime.now(timezone.utc).date().isoformat())).fetchone()
+            if effective:
+                db.rollback()
+                flash("An effective authorization already exists for this purpose. Withdraw it before recording a replacement.", "error")
+                return redirect(url_for("student_detail", student_id=student_id))
+            db.execute("""INSERT INTO data_use_authorizations(
+                institution,student_id,purpose,authority_basis,data_categories_json,evidence_reference,note,
+                status,valid_until,recorded_by,recorded_at)
+                VALUES(?,?,?,?,?,?,?,'active',?,?,?)""",
+                (institution, student_id, purpose, basis, json.dumps(categories), evidence_reference, note,
+                 valid_until, session["username"], now()))
+            authorization_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+            db.commit()
+        audit("privacy.authorization_recorded", "data_use_authorization", authorization_id,
+              f"Purpose={purpose}; basis={basis}; categories={','.join(categories)}; evidence_ref_present={bool(evidence_reference)}")
+        flash("Authorization record saved. Confirm the underlying authority and evidence independently.", "success")
+    except sqlite3.IntegrityError:
+        flash("The authorization record could not be saved; verify the student and selected values.", "error")
+    return redirect(url_for("student_detail", student_id=student_id))
+
+
+@app.route("/students/<int:student_id>/authorizations/<int:authorization_id>/withdraw", methods=["POST"])
+@login_required
+@role_required("institution_admin", "operator")
+@write_role_required("institution_admin", "operator")
+def authorization_withdraw(student_id, authorization_id):
+    institution = session.get("institution", "")
+    with connect_db() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT id,status FROM data_use_authorizations WHERE id=? AND student_id=? AND institution=?",
+                         (authorization_id, student_id, institution)).fetchone()
+        if not row:
+            db.rollback()
+            abort(404)
+        if row["status"] != "active":
+            db.rollback()
+            flash("This authorization has already been withdrawn.", "error")
+            return redirect(url_for("student_detail", student_id=student_id))
+        timestamp = now()
+        db.execute("UPDATE data_use_authorizations SET status='withdrawn',withdrawn_by=?,withdrawn_at=? WHERE id=? AND student_id=? AND institution=? AND status='active'",
+                   (session["username"], timestamp, authorization_id, student_id, institution))
+        db.commit()
+    audit("privacy.authorization_withdrawn", "data_use_authorization", authorization_id,
+          "Authorization withdrawn; prior submissions retain their recorded authorization reference")
+    flash("Authorization withdrawn for future submissions. Existing submissions were not deleted.", "success")
+    return redirect(url_for("student_detail", student_id=student_id))
+
+
+# ---------------------------------------------------------
 # Student details and history
 # ---------------------------------------------------------
 
@@ -1397,6 +1615,12 @@ def student_detail(student_id):
         WHERE c.student_id=? AND c.institution=? ORDER BY c.created_at DESC LIMIT 10""",
         (student_id, session.get("institution"))).fetchall()
 
+    authorizations = db.execute("""SELECT id,purpose,authority_basis,data_categories_json,evidence_reference,note,status,
+        valid_until,recorded_by,recorded_at,withdrawn_by,withdrawn_at
+        FROM data_use_authorizations WHERE institution=? AND student_id=?
+        ORDER BY recorded_at DESC,id DESC LIMIT 50""",
+        (session.get("institution"), student_id)).fetchall()
+
     possible_duplicate = db.execute("""SELECT 1 FROM duplicate_candidates
         WHERE institution_id=? AND status='pending_review'
         AND (student_a_id=? OR student_b_id=?) LIMIT 1""",
@@ -1426,6 +1650,8 @@ def student_detail(student_id):
         "student_detail.html",
         student=student,
         cases=cases,
+        authorizations=[{**dict(row), "data_categories": json.loads(row["data_categories_json"])} for row in authorizations],
+        can_manage_authorizations=session.get("role") in {"admin", "institution_admin", "operator"},
         verification_result=verification_result,
         quality_issues=quality_issues,
         readiness=readiness,
@@ -1749,8 +1975,8 @@ def student_restore(student_id):
             flash("Provide an institutional student ID up to 80 characters.", "error")
             return redirect(url_for("archived_students"))
         conflict = db.execute(
-            "SELECT id FROM students WHERE institution_student_id=? AND id<>?",
-            (code, student_id),
+            "SELECT id FROM students WHERE lower(trim(institution))=lower(trim(?)) AND lower(trim(institution_student_id))=lower(trim(?)) AND id<>?",
+            (institution, code, student_id),
         ).fetchone()
         if conflict:
             db.rollback()
@@ -1938,7 +2164,7 @@ def imports():
         job_id, created_at, parsed, seen = secrets.token_hex(16), now(), [], set()
         accepted = rejected = 0
         with connect_db() as db:
-            existing_codes = {str(r[0]).casefold().strip() for r in db.execute("SELECT institution_student_id FROM students")}
+            existing_codes = {str(r[0]).casefold().strip() for r in db.execute("SELECT institution_student_id FROM students WHERE institution=?", (institution,))}
             names = {" ".join((r[0] or "").casefold().split()) for r in db.execute("SELECT full_name FROM students WHERE institution=? AND archived_at IS NULL", (institution,))}
             emails = {str(r[0]).casefold().strip() for r in db.execute("SELECT email FROM students WHERE institution=? AND archived_at IS NULL AND email<>''", (institution,))}
             for line_number, raw_row in enumerate(reader, start=2):
@@ -2001,7 +2227,7 @@ def confirm_import(job_id):
             flash("This import was already committed; no records were added again.", "success")
             return redirect(url_for("imports", job_id=job_id))
         rows = db.execute("SELECT * FROM import_job_rows WHERE job_id=? AND is_valid=1 ORDER BY row_number", (job_id,)).fetchall()
-        existing = {str(r[0]).casefold().strip() for r in db.execute("SELECT institution_student_id FROM students")}
+        existing = {str(r[0]).casefold().strip() for r in db.execute("SELECT institution_student_id FROM students WHERE institution=?", (institution,))}
         if any(r["student_code"].casefold().strip() in existing for r in rows):
             db.rollback()
             flash("A record changed after preview. Upload a corrected file to create a fresh preview.", "error")
@@ -2138,6 +2364,188 @@ def too_large(_error):
               "Source upload exceeded the configured request limit; file content omitted")
     flash("Upload exceeds the 2 MB limit.", "error")
     return redirect(url_for("source_datasets" if request.path.startswith("/source-datasets") else "imports"))
+
+
+# ---------------------------------------------------------
+# Admissions and intake workflow (institution-scoped)
+# ---------------------------------------------------------
+
+@app.route("/admissions", methods=["GET"])
+@login_required
+@role_required("institution_admin", "operator", "verifier", "auditor")
+def admissions_workspace():
+    institution = session.get("institution")
+    with connect_db() as db:
+        programmes = db.execute("SELECT * FROM programmes WHERE institution=? ORDER BY name", (institution,)).fetchall()
+        allocations = db.execute("""SELECT a.*,p.code AS programme_code,p.name AS programme_name,
+            (SELECT COUNT(*) FROM enrolments e WHERE e.allocation_id=a.id AND e.status NOT IN ('withdrawn','rejected')) AS enrolled
+            FROM intake_allocations a JOIN programmes p ON p.id=a.programme_id
+            WHERE a.institution=? ORDER BY a.intake_year DESC,p.name""", (institution,)).fetchall()
+        enrolments = db.execute("""SELECT e.*,s.full_name,s.institution_student_id,a.intake_year,p.code AS programme_code,p.name AS programme_name
+            FROM enrolments e JOIN students s ON s.id=e.student_id
+            JOIN intake_allocations a ON a.id=e.allocation_id JOIN programmes p ON p.id=a.programme_id
+            WHERE e.institution=? ORDER BY e.updated_at DESC,e.id DESC LIMIT 100""", (institution,)).fetchall()
+    return render_template("admissions.html", programmes=programmes, allocations=allocations, enrolments=enrolments,
+                           can_write=session.get("role") in ("admin", "institution_admin", "operator"), current_year=datetime.now().year)
+
+
+@app.route("/admissions/programmes", methods=["POST"])
+@login_required
+@role_required("institution_admin", "operator")
+def programme_create():
+    code = request.form.get("code", "").strip().upper()
+    name = request.form.get("name", "").strip()
+    if not code or len(code) > 32 or not name or len(name) > 120:
+        flash("Enter a programme code (up to 32 characters) and name (up to 120 characters).", "error")
+        return redirect(url_for("admissions_workspace"))
+    try:
+        with connect_db() as db:
+            db.execute("INSERT INTO programmes(institution,code,name,created_by,created_at) VALUES(?,?,?,?,?)",
+                       (session["institution"], code, name, session["username"], now()))
+            db.commit()
+        audit("admissions.programme_created", "programme", code, "Programme created")
+        flash("Programme created.", "success")
+    except sqlite3.IntegrityError:
+        flash("That programme code already exists in this institution.", "error")
+    return redirect(url_for("admissions_workspace"))
+
+
+@app.route("/admissions/intakes", methods=["POST"])
+@login_required
+@role_required("institution_admin", "operator")
+def intake_create():
+    try:
+        programme_id = int(request.form.get("programme_id", ""))
+        year = int(request.form.get("intake_year", ""))
+        capacity = int(request.form.get("capacity", ""))
+        status = request.form.get("status", "draft")
+        if not (2000 <= year <= 2100 and 1 <= capacity <= 100000 and status in {"draft", "open", "closed"}):
+            raise ValueError
+        with connect_db() as db:
+            programme = db.execute("SELECT id FROM programmes WHERE id=? AND institution=? AND active=1",
+                                  (programme_id, session["institution"])).fetchone()
+            if not programme:
+                flash("Choose a programme belonging to your institution.", "error")
+                return redirect(url_for("admissions_workspace"))
+            db.execute("INSERT INTO intake_allocations(institution,programme_id,intake_year,capacity,status,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                       (session["institution"], programme_id, year, capacity, status, session["username"], now(), now()))
+            db.commit()
+        audit("admissions.intake_created", "intake_allocation", f"{programme_id}:{year}", f"Capacity {capacity}; status {status}")
+        flash("Intake allocation created.", "success")
+    except (ValueError, TypeError, sqlite3.IntegrityError):
+        flash("Check the programme, year, capacity, and duplicate intake details.", "error")
+    return redirect(url_for("admissions_workspace"))
+
+
+@app.route("/admissions/enrolments", methods=["POST"])
+@login_required
+@role_required("institution_admin", "operator")
+def enrolment_create():
+    code = request.form.get("institutional_enrolment_id", "").strip()
+    try:
+        student_id = int(request.form.get("student_id", ""))
+        allocation_id = int(request.form.get("allocation_id", ""))
+        if not code or len(code) > 64:
+            raise ValueError
+        with connect_db() as db:
+            # Serialize capacity checks and inserts. Without an immediate write lock,
+            # two concurrent requests could both observe the final available place.
+            db.execute("BEGIN IMMEDIATE")
+            institution = session["institution"]
+            student = db.execute("SELECT id FROM students WHERE id=? AND institution=? AND archived_at IS NULL", (student_id, institution)).fetchone()
+            allocation = db.execute("SELECT id,capacity,status FROM intake_allocations WHERE id=? AND institution=?", (allocation_id, institution)).fetchone()
+            if not student or not allocation or allocation["status"] != "open":
+                db.rollback()
+                flash("Choose an active student and an open intake from your institution.", "error")
+                return redirect(url_for("admissions_workspace"))
+            duplicate_code = db.execute("SELECT 1 FROM enrolments WHERE lower(trim(institution))=lower(trim(?)) AND lower(trim(institutional_enrolment_id))=lower(trim(?)) LIMIT 1", (institution, code)).fetchone()
+            if duplicate_code:
+                db.rollback()
+                flash("That enrolment ID already exists in this institution.", "error")
+                return redirect(url_for("admissions_workspace"))
+            count = db.execute("SELECT COUNT(*) FROM enrolments WHERE allocation_id=? AND status NOT IN ('withdrawn','rejected')", (allocation_id,)).fetchone()[0]
+            if count >= allocation["capacity"]:
+                db.rollback()
+                flash("This intake has reached its configured capacity.", "error")
+                return redirect(url_for("admissions_workspace"))
+            timestamp = now()
+            db.execute("INSERT INTO enrolments(institution,student_id,allocation_id,institutional_enrolment_id,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                       (institution, student_id, allocation_id, code, session["username"], timestamp, timestamp))
+            db.commit()
+        audit("admissions.enrolment_created", "enrolment", code, "Draft enrolment created")
+        flash("Draft enrolment created.", "success")
+    except (ValueError, TypeError, sqlite3.IntegrityError):
+        flash("Check the student, intake, enrolment ID, and existing enrolments.", "error")
+    return redirect(url_for("admissions_workspace"))
+
+
+@app.route("/admissions/enrolments/<int:enrolment_id>", methods=["GET", "POST"])
+@login_required
+@role_required("institution_admin", "operator", "verifier", "auditor")
+def enrolment_detail(enrolment_id):
+    institution = session.get("institution")
+    with connect_db() as db:
+        enrolment = db.execute("""SELECT e.*,s.full_name,s.institution_student_id,p.name AS programme_name,p.code AS programme_code,a.intake_year
+            FROM enrolments e JOIN students s ON s.id=e.student_id JOIN intake_allocations a ON a.id=e.allocation_id
+            JOIN programmes p ON p.id=a.programme_id WHERE e.id=? AND e.institution=?""", (enrolment_id,institution)).fetchone()
+        if not enrolment:
+            abort(404)
+        if request.method == "POST":
+            action = request.form.get("action", "")
+            note = request.form.get("note", "").strip()[:1000]
+            role = {"admin":"institution_admin"}.get(session.get("role"),session.get("role"))
+            if action == "submit" and role in {"institution_admin","operator"} and enrolment["status"] in {"draft","returned_for_correction"}:
+                # Lock before calculating the version to prevent duplicate version races.
+                db.execute("BEGIN IMMEDIATE")
+                current_status = db.execute("SELECT status FROM enrolments WHERE id=? AND institution=?", (enrolment_id, institution)).fetchone()
+                if not current_status or current_status["status"] not in {"draft", "returned_for_correction"}:
+                    db.rollback()
+                    flash("This enrolment has already been submitted. Refresh and check its current status.", "error")
+                    return redirect(url_for("enrolment_detail", enrolment_id=enrolment_id))
+                authorization = db.execute("""SELECT id,data_categories_json FROM data_use_authorizations
+                    WHERE institution=? AND student_id=(SELECT student_id FROM enrolments WHERE id=? AND institution=?)
+                      AND purpose='admissions_submission' AND status='active'
+                      AND (valid_until IS NULL OR valid_until>=?)
+                    ORDER BY recorded_at DESC,id DESC LIMIT 1""",
+                    (institution, enrolment_id, institution, datetime.now(timezone.utc).date().isoformat())).fetchone()
+                required_categories = {"identity", "academic_record", "admissions_record"}
+                authorized_categories = set(json.loads(authorization["data_categories_json"])) if authorization else set()
+                if not authorization or not required_categories.issubset(authorized_categories):
+                    db.rollback()
+                    flash("An effective admissions authorization covering identity, academic record, and admissions record is required before submission.", "error")
+                    return redirect(url_for("enrolment_detail", enrolment_id=enrolment_id))
+                version = db.execute("SELECT COALESCE(MAX(version),0)+1 FROM enrolment_submissions WHERE enrolment_id=?", (enrolment_id,)).fetchone()[0]
+                timestamp = now()
+                db.execute("INSERT INTO enrolment_submissions(institution,enrolment_id,version,status,submitted_by,submitted_at,authorization_id) VALUES(?,?,?,?,?,?,?)",
+                           (institution,enrolment_id,version,"submitted",session["username"],timestamp,authorization["id"]))
+                db.execute("UPDATE enrolments SET status='submitted',updated_at=? WHERE id=? AND institution=?", (timestamp,enrolment_id,institution))
+                db.commit()
+                audit("admissions.submitted", "enrolment", enrolment_id, f"Submission version {version}")
+                flash("Enrolment submitted for review.", "success")
+            elif action in {"approve","reject","return"} and role in {"institution_admin","verifier"} and enrolment["status"] in {"submitted","under_review"}:
+                if action in {"reject", "return"} and not note:
+                    flash("Provide a reason when rejecting or returning a submission.", "error")
+                    return redirect(url_for("enrolment_detail", enrolment_id=enrolment_id))
+                mapping = {"approve":("approved","approved"),"reject":("rejected","rejected"),"return":("returned_for_correction","returned_for_correction")}
+                submission_status, enrolment_status = mapping[action]
+                db.execute("BEGIN IMMEDIATE")
+                timestamp = now()
+                updated = db.execute("UPDATE enrolment_submissions SET status=?,reviewed_by=?,reviewed_at=?,review_note=? WHERE enrolment_id=? AND version=(SELECT MAX(version) FROM enrolment_submissions WHERE enrolment_id=?) AND status IN ('submitted','under_review')",
+                           (submission_status,session["username"],timestamp,note,enrolment_id,enrolment_id)).rowcount
+                if not updated:
+                    db.rollback()
+                    flash("The submission has already been reviewed. Refresh and check its current status.", "error")
+                    return redirect(url_for("enrolment_detail", enrolment_id=enrolment_id))
+                db.execute("UPDATE enrolments SET status=?,updated_at=? WHERE id=? AND institution=?", (enrolment_status,timestamp,enrolment_id,institution))
+                db.commit()
+                audit("admissions."+action, "enrolment", enrolment_id, note or "Approved")
+                flash("Review decision recorded.", "success")
+            else:
+                flash("This action is not allowed for your role or the current workflow state.", "error")
+            return redirect(url_for("enrolment_detail", enrolment_id=enrolment_id))
+        submissions = db.execute("SELECT * FROM enrolment_submissions WHERE enrolment_id=? AND institution=? ORDER BY version DESC", (enrolment_id,institution)).fetchall()
+    return render_template("enrolment_detail.html", enrolment=enrolment, submissions=submissions,
+                           current_role={"admin":"institution_admin"}.get(session.get("role"),session.get("role")), current_year=datetime.now().year)
 
 
 # Initialize the existing application database.

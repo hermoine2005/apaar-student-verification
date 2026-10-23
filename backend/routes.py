@@ -438,9 +438,9 @@ def students_create():
         return jsonify({"error": "validation_error", "message": "Student fields failed validation", "issues": errors}), 400
     db, now = get_db(), utc_now()
     try:
-        cur = db.execute("INSERT INTO students (institution_student_id,full_name,institution,course,semester,email,status,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        cur = db.execute("INSERT INTO students (institution_student_id,full_name,institution,course,semester,apaar_id,email,status,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
           (code, name, g.actor.institution_id, str(d.get("course") or ""),
-           str(d.get("academic_year") or ""), str(d.get("email") or ""),
+           str(d.get("academic_year") or ""), record["apaar_id"], str(d.get("email") or ""),
            "Pending verification", "Created through shared API", now, now))
         sid = str(cur.lastrowid)
         record_event(g.actor.institution_id, g.actor.user_id, "student.created", "student", sid, {})

@@ -1,4 +1,4 @@
-﻿import pytest
+import pytest
 import sqlite3
 from io import BytesIO
 from app import app as flask_app
@@ -58,6 +58,30 @@ def test_api_and_website_share_student_records(client):
     assert api_after_edit["id"] == str(website_row["id"])
     assert api_after_edit["full_name"] == "Website Updated Student"
     assert api_after_edit["course"] == "Updated Engineering"
+
+
+def test_api_student_create_persists_apaar_id_without_exposing_it(client):
+    synthetic_identifier = "SYNTHETIC-APAAR-9081"
+    created = client.post("/api/v1/students", json={
+        "student_code": "API-APAAR-001",
+        "full_name": "Synthetic APAAR Student",
+        "course": "Engineering",
+        "academic_year": "2",
+        "apaar_id": synthetic_identifier,
+    })
+    assert created.status_code == 201
+    student_id = created.json["id"]
+
+    with app_module.connect_db() as db:
+        stored = db.execute(
+            "SELECT apaar_id FROM students WHERE id=? AND institution=?",
+            (student_id, "MITAOE Demo Campus"),
+        ).fetchone()
+    assert stored is not None
+    assert stored["apaar_id"] == synthetic_identifier
+    assert synthetic_identifier not in client.get("/api/v1/students").get_data(as_text=True)
+    assert synthetic_identifier not in client.get(f"/students/{student_id}").get_data(as_text=True)
+    assert synthetic_identifier not in client.get("/students/export.csv").get_data(as_text=True)
 
 
 def test_api_update_conflict_rolls_back_and_hides_other_tenants(client):

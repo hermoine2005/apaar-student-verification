@@ -1,4 +1,4 @@
-"""Synthetic source dataset timing harness (not collected by pytest).
+r"""Synthetic source dataset timing harness (not collected by pytest).
 
 Run from the repository root with:
     .\.venv\Scripts\python.exe tests\benchmark_source_datasets.py

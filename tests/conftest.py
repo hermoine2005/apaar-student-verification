@@ -2,6 +2,8 @@
 import os
 import re
 
+import pytest
+
 
 def pytest_configure(config):
     # Keep automated tests isolated from the application's normal database.
@@ -75,3 +77,24 @@ def login_client(client, username="admin", password="ChangeMe123!"):
         client.environ_base["HTTP_X_CSRF_TOKEN"] = csrf_token
 
     return response
+
+
+@pytest.fixture()
+def client(tmp_path, monkeypatch):
+    """Provide each test an isolated Flask client and disposable SQLite database."""
+    import app as app_module
+    from backend.db import init_db as init_backend_db
+
+    db_path = tmp_path / "app-test.db"
+    monkeypatch.setenv("APAAR_DB_PATH", str(db_path))
+    monkeypatch.setattr(app_module, "DB_PATH", str(db_path))
+    app_module.app.config.update(
+        TESTING=True,
+        SECRET_KEY="pytest-only-secret",
+        APAAR_DB_PATH=str(db_path),
+    )
+    app_module.init_db()
+    with app_module.app.app_context():
+        init_backend_db()
+    with app_module.app.test_client() as test_client:
+        yield test_client

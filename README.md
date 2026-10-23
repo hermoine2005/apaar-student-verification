@@ -20,9 +20,11 @@ python -m pytest -q
 python app.py
 ```
 
-Open <http://127.0.0.1:5000>. On a fresh local demo database created from `.env.example`, the account is `admin` / `ChangeMe123!`. Before production initialization, set a private `SECRET_KEY` and a `DEMO_ADMIN_PASSWORD` of at least 16 characters; the default demo password is rejected and hidden on production login pages. The random secret fallback invalidates sessions on restart. Set `COOKIE_SECURE=1` when serving through HTTPS.
+Before the first launch, edit `.env` and replace the `SECRET_KEY` and `DEMO_ADMIN_PASSWORD` placeholders with private values. The app now treats every `replace-with-` secret as a placeholder; never keep one in production. Set `APP_ENV=production` for production-mode secret validation. Use a unique password of at least 16 characters. The first database initialization creates the `admin` account using that password; later launches do not reset an existing account. If the account needs to be created or reset explicitly, use `bootstrap_admin.py`, which prompts for credentials without echoing the password and requires `--update-existing` before resetting a matching account.
 
-`run.cmd` is also available for setup and launch. Do not expose Flask's development server to the public internet.
+Open <http://127.0.0.1:5000>. Set `COOKIE_SECURE=1` when serving through HTTPS. `run.cmd` is also available for setup and launch. Do not expose Flask's development server to the public internet.
+
+See [Phase 1 security and correctness changes](docs/PHASE1_SECURITY_FIXES.md) for the latest implementation log and validation status.
 
 ## Database and backup
 
@@ -70,7 +72,7 @@ The dashboard includes institution-scoped student status distribution, open-case
 python -m pytest -q
 ```
 
-The test suite runs with `python -m pytest -q` and covers Flask login, CSRF, login throttling, production first-admin safeguards, student archive/restoration, account administration, case migration and rollback, reviewer separation, evidence metadata, backup-before-migration, API/website shared IDs and updates, tenant isolation, rejected identity headers, API rollback, CSV preview/confirmation/idempotency/rollback, filtering/pagination, duplicate review, audit hash-chain tampering, audit metadata minimization, case timeline ordering, age categories, and case report authorization/privacy. Verification tests cover direct status tampering, legacy status normalization, identifier redaction, provider configuration and synthetic outcomes. Source dataset tests cover CSV import limits, tenant scope, rollback, version diffs, comparison outcomes, provenance, and audit behavior. On 2026-10-23, `.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider` completed with 90 passed and exit code 0; the test fixture selected `.pytest_cache/apaar-test.db`.
+The test suite runs with `python -m pytest -q` and covers Flask login, CSRF, login throttling, production first-admin safeguards, student archive/restoration, account administration, case migration and rollback, reviewer separation, evidence metadata, backup-before-migration, API/website shared IDs and updates, tenant isolation, rejected identity headers, API rollback, CSV preview/confirmation/idempotency/rollback, filtering/pagination, duplicate review, audit hash-chain tampering, audit metadata minimization, case timeline ordering, age categories, and case report authorization/privacy. Verification tests cover direct status tampering, legacy status normalization, identifier redaction, provider configuration and synthetic outcomes. Source dataset tests cover CSV import limits, tenant scope, rollback, version diffs, comparison outcomes, provenance, and audit behavior. A previous development run recorded 90 passing tests, but that result was not reproducible in the current packaging environment and does not include all later tests. The current full-suite result is **unverified** until `python -m pytest -q` succeeds in a configured virtual environment.
 
 ## Current security and workflow limits
 
@@ -92,3 +94,19 @@ See [the current state audit](docs/CURRENT_STATE_AUDIT.md) for verified architec
 ## End-to-end demonstration
 
 For a repeatable, isolated synthetic-data rehearsal, follow [the verification workbench walkthrough](docs/DEMO_WORKBENCH.md). It refuses to reuse an existing demo database path and keeps the primary and legacy databases separate.
+
+## Database migration note
+
+On first startup after this update, the app creates a verified SQLite backup before migrating student identifiers from globally unique to institution-scoped unique. Student IDs can then repeat across institutions but remain unique (case-insensitively) within each institution. If existing records already conflict within one institution, startup stops safely and asks you to resolve the duplicates first. Backups are written beside the database and should be retained until validation is complete.
+
+### Admissions workflow hardening (Phase 4)
+
+Capacity checks and enrolment creation are serialized in SQLite transactions; submission versioning rechecks the live workflow state under a write lock. Enrolment IDs are checked case-insensitively within the institution, and rejection/return decisions require a reason. See [Phase 4 implementation notes](docs/PHASE4_ADMISSIONS_HARDENING.md). The new regression tests are included, but the full suite must be rerun in the configured project virtual environment before relying on this build; Flask was not available in the packaging environment.
+### Phase 5: data-use authorization register
+
+The student profile now includes a purpose-limited internal authorization register. Admissions submission requires an unexpired authorization covering identity, academic records, and admissions records, and each submission version records the authorization used. This register is not a legal determination or proof that consent was validly obtained. See `docs/PHASE5_DATA_USE_AUTHORIZATION.md` for limitations and validation status.
+
+
+### Current audit caveat
+
+The current source has passed Python syntax compilation, but this environment does not have Flask/Werkzeug and cannot reach the package index. Consequently, no claim is made that the full Flask integration suite passes in this build. See `docs/ENGINEERING_STATUS.md` for the precise validation boundary and outstanding work.

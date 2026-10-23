@@ -28,6 +28,22 @@ def login(client):
     login_client(client)
     return client.get("/", follow_redirects=True)
 
+
+def test_secret_key_placeholder_is_never_used_as_a_real_secret():
+    with pytest.raises(RuntimeError, match="private SECRET_KEY"):
+        app_module.resolve_secret_key("replace-with-a-random-secret-key", production=True)
+    generated = app_module.resolve_secret_key("replace-with-a-random-secret-key", production=False)
+    assert len(generated) >= 64
+    assert generated != "replace-with-a-random-secret-key"
+    assert app_module.resolve_secret_key("a-real-configured-secret") == "a-real-configured-secret"
+
+
+def test_context_managed_database_connections_are_closed():
+    with app_module.connect_db() as db:
+        db.execute("SELECT 1")
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        db.execute("SELECT 1")
+
 def test_login_and_dashboard(client):
     response = login(client)
     assert response.status_code == 200

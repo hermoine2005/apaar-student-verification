@@ -21,7 +21,7 @@ if not exist ".env" copy ".env.example" ".env" >nul
 echo.
 echo Starting APAAR Student Verification demo...
 echo Open http://127.0.0.1:5000
-echo Demo login: admin / ChangeMe123!
-echo Change the demo password before any shared use.
+echo Configure SECRET_KEY and DEMO_ADMIN_PASSWORD in .env before first startup.
+echo Use a unique password of at least 16 characters.
 python app.py
 pause
