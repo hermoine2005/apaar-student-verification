@@ -1,4 +1,4 @@
-import pytest
+﻿import pytest
 import sqlite3
 from io import BytesIO
 from app import app as flask_app
@@ -354,7 +354,7 @@ def test_end_to_end_synthetic_sih_workflow(client):
 
     # A second verifier reviews metadata and resolves the case.
     client.post("/admin/users", data={
-        "username": "sih-verifier", "password": "Sih-Demo-Reviewer-Password-44", "role": "verifier",
+        "username": "sih-verifier", "email": "sih-verifier@example.test", "password": "Sih-Demo-Reviewer-Password-44", "role": "verifier",
     })
     opened = client.post("/api/v1/verification/cases", json={
         "student_id": str(student_id), "case_type": "synthetic_demo_review",
@@ -609,3 +609,4 @@ def test_role_matrix_enforces_read_write_and_tenant_scopes(client):
         if role != "institution_admin":
             with sqlite3.connect(app_module.DB_PATH) as db:
                 assert db.execute("SELECT 1 FROM users WHERE username=?", (f"escalation-{role}",)).fetchone() is None
+

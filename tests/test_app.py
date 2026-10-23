@@ -1,4 +1,4 @@
-import os
+﻿import os
 import sqlite3
 import tempfile
 import io
@@ -381,7 +381,7 @@ def test_institution_admin_user_management_hashes_password_and_limits_roles(clie
     login(client)
     assert client.get("/admin/users").status_code == 200
     created = client.post("/admin/users", data={
-        "username": "new-auditor", "password": "A-Strong-Temporary-Password-42", "role": "auditor",
+        "username": "new-auditor", "email": "new-auditor@example.test", "password": "A-Strong-Temporary-Password-42", "role": "auditor",
     }, follow_redirects=True)
     assert created.status_code == 200 and b"User account created" in created.data
     with sqlite3.connect(app_module.DB_PATH) as db:
@@ -553,3 +553,4 @@ def test_additive_schema_upgrade_creates_verified_backup_and_preserves_rows(tmp_
         assert {"run_status", "ruleset_version", "input_digest", "result_digest",
                 "student_updated_at_snapshot", "outcome_counts_json"}.issubset(comparison_columns)
         assert upgraded.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+

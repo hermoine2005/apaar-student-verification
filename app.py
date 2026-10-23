@@ -1,8 +1,9 @@
-import csv
+﻿import csv
 import hashlib
 import io
 import json
 import os
+import re
 import hmac
 import secrets
 import sqlite3
@@ -19,6 +20,7 @@ from backend.audit import verify_chain
 from backend.audit import record_event
 from backend.cases import create_case
 from backend.data_quality import validate_student_record
+from backend.readiness import score_student_readiness
 from backend.source_data import (parse_source_csv, compare_student, encode_preview,
                                  version_diff, MAX_SOURCE_BYTES,
                                  SOURCE_COMPARISON_RULESET_VERSION)
@@ -348,6 +350,26 @@ def init_db():
             db.execute("ALTER TABLE users ADD COLUMN created_at TEXT")
         if "updated_at" not in user_columns:
             db.execute("ALTER TABLE users ADD COLUMN updated_at TEXT")
+        if "email" not in user_columns:
+            db.execute("ALTER TABLE users ADD COLUMN email TEXT")
+        if "email_verified_at" not in user_columns:
+            db.execute("ALTER TABLE users ADD COLUMN email_verified_at TEXT")
+        if "session_version" not in user_columns:
+            db.execute("ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 0")
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS auth_challenges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                token_hash TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                consumed_at REAL,
+                request_ip TEXT
+            )
+        """)
+        db.execute("CREATE INDEX IF NOT EXISTS idx_auth_challenges_user ON auth_challenges(username,purpose,created_at)")
         db.execute("UPDATE users SET created_at=COALESCE(created_at,?), updated_at=COALESCE(updated_at,?)",
                    (now(), now()))
         audit_columns = {row[1] for row in db.execute("PRAGMA table_info(audit_logs)")}
@@ -382,7 +404,7 @@ def init_db():
             if not admin_password:
                 admin_password = "ChangeMe123!"
             db.execute(
-                "INSERT INTO users(username,password_hash,role,institution,is_active,created_at,updated_at) VALUES(?,?,?,?,1,?,?)",
+                "INSERT INTO users(username,password_hash,role,institution,is_active,created_at,updated_at,email) VALUES(?,?,?,?,1,?,?,?)",
                 (
                     "admin",
                     generate_password_hash(admin_password),
@@ -390,6 +412,7 @@ def init_db():
                     "MITAOE Demo Campus",
                     now(),
                     now(),
+                    os.environ.get("DEMO_ADMIN_EMAIL", "").strip().lower() or None,
                 ),
             )
 
@@ -519,10 +542,11 @@ def login_required(fn):
             return redirect(url_for("login", next=request.path))
         with connect_db() as db:
             user = db.execute(
-                "SELECT role, institution, is_active FROM users WHERE username=?",
+                "SELECT role, institution, is_active, session_version FROM users WHERE username=?",
                 (session["username"],),
             ).fetchone()
-        if not user or not user["is_active"]:
+        if (not user or not user["is_active"]
+                or int(session.get("session_version", 0)) != int(user["session_version"] or 0)):
             session.clear()
             return redirect(url_for("login", next=request.path))
         session["role"] = user["role"]
@@ -571,6 +595,205 @@ def write_role_required(*allowed_roles):
     return decorate
 
 
+def _send_auth_code(email, code, subject, body):
+    """Deliver auth codes via SMTP; expose codes only to Flask's isolated test client."""
+    if app.testing:
+        # Test-only capture lets automated tests complete the real OTP flow without SMTP.
+        # This branch is disabled unless Flask TESTING is explicitly enabled.
+        app.extensions.setdefault("test_auth_codes", {})[(email.lower(), subject)] = code
+        return
+    host = os.environ.get("SMTP_HOST", "").strip()
+    if not host:
+        if os.environ.get("FLASK_ENV") == "production":
+            raise RuntimeError("Email delivery is not configured.")
+        app.logger.warning("LOCAL DEVELOPMENT AUTH MESSAGE for %s: %s | %s", email or "(no email)", subject, body.format(code=code))
+        return
+    import smtplib
+    from email.message import EmailMessage
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = os.environ.get("SMTP_FROM", os.environ.get("SMTP_USERNAME", "noreply@localhost"))
+    message["To"] = email
+    message.set_content(body.format(code=code))
+    with smtplib.SMTP(host, int(os.environ.get("SMTP_PORT", "587")), timeout=10) as smtp:
+        if os.environ.get("SMTP_STARTTLS", "1") == "1":
+            smtp.starttls()
+        username = os.environ.get("SMTP_USERNAME", "")
+        password = os.environ.get("SMTP_PASSWORD", "")
+        if username:
+            smtp.login(username, password)
+        smtp.send_message(message)
+
+
+def _create_auth_challenge(username, purpose, email):
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    stamp = time.time()
+    with connect_db() as db:
+        db.execute("UPDATE auth_challenges SET consumed_at=? WHERE username=? AND purpose=? AND consumed_at IS NULL",
+                   (stamp, username, purpose))
+        db.execute("""INSERT INTO auth_challenges(username,purpose,token_hash,created_at,expires_at,request_ip)
+                      VALUES(?,?,?,?,?,?)""",
+                   (username, purpose, hashlib.sha256(code.encode()).hexdigest(),
+                    stamp, stamp + int(os.environ.get("AUTH_CODE_TTL_SECONDS", "600")),
+                    request.remote_addr or "unknown"))
+    _send_auth_code(email, code, "APAAR Verify security code",
+                    "Your APAAR Verify security code is {code}. It expires in 10 minutes. If you did not request it, ignore this message.")
+    return code
+
+
+def _consume_auth_challenge(username, purpose, code):
+    stamp = time.time()
+    with connect_db() as db:
+        row = db.execute("""SELECT * FROM auth_challenges WHERE username=? AND purpose=?
+                            AND consumed_at IS NULL ORDER BY id DESC LIMIT 1""",
+                         (username, purpose)).fetchone()
+        if not row or row["expires_at"] < stamp or row["attempts"] >= 5:
+            return False
+        digest = hashlib.sha256(code.strip().encode()).hexdigest()
+        if not hmac.compare_digest(row["token_hash"], digest):
+            db.execute("UPDATE auth_challenges SET attempts=attempts+1 WHERE id=?", (row["id"],))
+            return False
+        db.execute("UPDATE auth_challenges SET consumed_at=? WHERE id=?", (stamp, row["id"]))
+        return True
+
+
+@app.route("/verify-otp", methods=["GET", "POST"])
+def verify_otp():
+    username = session.get("pending_otp_username")
+    if not username:
+        return redirect(url_for("login"))
+    if request.method == "POST":
+        if _consume_auth_challenge(username, "login", request.form.get("code", "")):
+            with connect_db() as db:
+                user = db.execute("SELECT * FROM users WHERE username=? AND is_active=1", (username,)).fetchone()
+            if not user:
+                session.clear()
+                return redirect(url_for("login"))
+            session.clear()
+            session["_csrf_token"] = secrets.token_urlsafe(32)
+            session["username"] = user["username"]
+            session["role"] = {"admin": "institution_admin"}.get(user["role"], user["role"])
+            session["institution"] = user["institution"]
+            session["session_version"] = user["session_version"] if "session_version" in user.keys() else 0
+            if not user["email_verified_at"]:
+                with connect_db() as db:
+                    db.execute("UPDATE users SET email_verified_at=?,updated_at=? WHERE username=?",
+                               (now(), now(), username))
+                    db.commit()
+            session.permanent = True
+            audit("login_otp_verified", "user", username, "Password and email OTP verified")
+            return redirect(url_for("dashboard"))
+        flash("The code is invalid, expired, or has reached its attempt limit.", "error")
+    return render_template("verify_otp.html")
+
+
+@app.route("/forgot-password", methods=["GET", "POST"])
+def forgot_password():
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        with connect_db() as db:
+            user = db.execute("SELECT username,email FROM users WHERE lower(email)=? AND is_active=1 AND email_verified_at IS NOT NULL", (email,)).fetchone()
+        # Same response for known and unknown addresses to reduce account enumeration.
+        if user:
+            try:
+                token = secrets.token_urlsafe(32)
+                stamp = time.time()
+                with connect_db() as db:
+                    db.execute("UPDATE auth_challenges SET consumed_at=? WHERE username=? AND purpose='reset' AND consumed_at IS NULL", (stamp, user["username"]))
+                    db.execute("INSERT INTO auth_challenges(username,purpose,token_hash,created_at,expires_at,request_ip) VALUES(?,?,?,?,?,?)",
+                               (user["username"], "reset", hashlib.sha256(token.encode()).hexdigest(), stamp, stamp+1800, request.remote_addr or "unknown"))
+                host = os.environ.get("PUBLIC_BASE_URL", request.url_root.rstrip("/"))
+                _send_auth_code(email, token, "Reset your APAAR Verify password",
+                                "Use this one-time password reset link within 30 minutes: " + host + "/reset-password/" + "{code}")
+            except (RuntimeError, OSError):
+                app.logger.exception("Password reset delivery failed")
+        flash("If the address belongs to a verified account, password reset instructions have been sent.", "info")
+        return redirect(url_for("login"))
+    return render_template("forgot_password.html")
+
+
+@app.route("/reset-password/<token>", methods=["GET", "POST"])
+def reset_password(token):
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    with connect_db() as db:
+        challenge = db.execute("""SELECT * FROM auth_challenges WHERE purpose='reset' AND token_hash=?
+                                  AND consumed_at IS NULL ORDER BY id DESC LIMIT 1""", (digest,)).fetchone()
+    if not challenge or challenge["expires_at"] < time.time() or challenge["attempts"] >= 5:
+        flash("This reset link is invalid or expired. Request a new one.", "error")
+        return redirect(url_for("forgot_password"))
+    if request.method == "POST":
+        password = request.form.get("password", "")
+        confirm = request.form.get("confirm_password", "")
+        if len(password) < 12 or len(password) > 256:
+            flash("Choose a password between 12 and 256 characters.", "error")
+        elif password != confirm:
+            flash("Passwords do not match.", "error")
+        else:
+            with connect_db() as db:
+                db.execute("UPDATE users SET password_hash=?,session_version=session_version+1,updated_at=? WHERE username=?",
+                           (generate_password_hash(password), now(), challenge["username"]))
+                db.execute("UPDATE auth_challenges SET consumed_at=? WHERE username=? AND purpose='reset' AND consumed_at IS NULL",
+                           (time.time(), challenge["username"]))
+                db.commit()
+            flash("Password updated. Sign in with your new password.", "success")
+            return redirect(url_for("login"))
+    return render_template("reset_password.html")
+
+
+@app.route("/help")
+def help_page():
+    return render_template("help.html")
+
+
+@app.route("/account/security", methods=["GET", "POST"])
+@login_required
+def account_security():
+    with connect_db() as db:
+        user = db.execute("SELECT id,username,email,email_verified_at FROM users WHERE username=?",
+                          (session.get("username"),)).fetchone()
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email) or len(email) > 254:
+            flash("Enter a valid email address.", "error")
+            return redirect(url_for("account_security"))
+        try:
+            code = f"{secrets.randbelow(1_000_000):06d}"
+            stamp = time.time()
+            with connect_db() as db:
+                db.execute("UPDATE auth_challenges SET consumed_at=? WHERE username=? AND purpose='email_verify' AND consumed_at IS NULL",
+                           (stamp, session.get("username")))
+                db.execute("INSERT INTO auth_challenges(username,purpose,token_hash,created_at,expires_at,request_ip) VALUES(?,?,?,?,?,?)",
+                           (session.get("username"), "email_verify", hashlib.sha256(code.encode()).hexdigest(),
+                            stamp, stamp+600, request.remote_addr or "unknown"))
+            _send_auth_code(email, code, "Verify your APAAR Verify email",
+                            "Your email verification code is {code}. It expires in 10 minutes.")
+            session["pending_email"] = email
+            flash("Verification code sent. Enter it to confirm the email.", "info")
+            return redirect(url_for("verify_email"))
+        except (RuntimeError, OSError):
+            flash("Email delivery is not configured or failed. Configure SMTP and try again.", "error")
+    return render_template("account_security.html", user=user)
+
+
+@app.route("/verify-email", methods=["GET", "POST"])
+@login_required
+def verify_email():
+    email = session.get("pending_email")
+    if not email:
+        return redirect(url_for("account_security"))
+    if request.method == "POST":
+        if _consume_auth_challenge(session.get("username"), "email_verify", request.form.get("code", "")):
+            with connect_db() as db:
+                db.execute("UPDATE users SET email=?,email_verified_at=?,updated_at=? WHERE username=?",
+                           (email, now(), now(), session.get("username")))
+                db.commit()
+            session.pop("pending_email", None)
+            flash("Email address verified.", "success")
+            return redirect(url_for("account_security"))
+        flash("Invalid or expired verification code.", "error")
+    return render_template("verify_otp.html", page_title="Verify email address")
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
@@ -592,15 +815,33 @@ def login():
 
         if user and check_password_hash(user["password_hash"], password):
             login_failures.pop(client_ip, None)
+            email = (user["email"] or "").strip() if "email" in user.keys() else ""
+            if not email:
+                # First-run bootstrap only: permit the seeded local administrator to enroll an email.
+                # Every subsequent sign-in requires OTP once an address is present.
+                if os.environ.get("FLASK_ENV") == "production":
+                    flash("This account has no email address. Ask the system administrator to configure it securely.", "error")
+                    return render_template("login.html", show_demo_credentials=False), 403
+                session.clear()
+                session["_csrf_token"] = secrets.token_urlsafe(32)
+                session["username"] = user["username"]
+                session["role"] = {"admin": "institution_admin"}.get(user["role"], user["role"])
+                session["institution"] = user["institution"]
+                session["session_version"] = user["session_version"] if "session_version" in user.keys() else 0
+                session.permanent = True
+                flash("Set and verify your email in Account security to enable OTP sign-in and password recovery.", "warning")
+                return redirect(url_for("account_security"))
+            try:
+                _create_auth_challenge(user["username"], "login", email)
+            except (RuntimeError, OSError):
+                app.logger.exception("Login OTP delivery failed")
+                flash("We could not send a security code. Please try later or contact your administrator.", "error")
+                return render_template("login.html", show_demo_credentials=os.environ.get("FLASK_ENV") != "production"), 503
             session.clear()
             session["_csrf_token"] = secrets.token_urlsafe(32)
-            session["username"] = user["username"]
-            session["role"] = user["role"]
-            session["institution"] = user["institution"]
-            session["_fresh"] = True
-            session.permanent = True
-            audit("login", "user", user["username"], "Successful login")
-            return redirect(url_for("dashboard"))
+            session["pending_otp_username"] = user["username"]
+            flash("A sign-in code was sent to your verified email address.", "info")
+            return redirect(url_for("verify_otp"))
 
         recent_failures.append(time.time())
         login_failures[client_ip] = recent_failures
@@ -626,7 +867,7 @@ def logout():
 def admin_users():
     with connect_db() as db:
         users = db.execute("""
-            SELECT id,username,role,institution,is_active,created_at
+            SELECT id,username,email,email_verified_at,role,institution,is_active,created_at
             FROM users WHERE institution=? ORDER BY username
         """, (session.get("institution"),)).fetchall()
     return render_template("admin_users.html", users=users,
@@ -640,26 +881,32 @@ def admin_user_create():
     from backend.db import get_db
     username = request.form.get("username", "").strip()
     password = request.form.get("password", "")
+    email = request.form.get("email", "").strip().lower()
     role = request.form.get("role", "")
     if (not username or len(username) > 40
             or not all(ch.isalnum() or ch in "._-" for ch in username)
             or len(username) < 3):
-        flash("Username must be 3–40 letters, numbers, dots, underscores, or hyphens.", "error")
+        flash("Username must be 3â€“40 letters, numbers, dots, underscores, or hyphens.", "error")
         return redirect(url_for("admin_users"))
     if len(password) < 12 or len(password) > 256:
         flash("Set a password between 12 and 256 characters.", "error")
         return redirect(url_for("admin_users"))
+    # Reject privileged/unknown roles before validating other fields. This ensures
+    # institution admins receive the correct permission error for attempted escalation.
     if role not in {"operator", "verifier", "auditor"}:
         flash("Select an approved non-administrator role.", "error")
+        return redirect(url_for("admin_users"))
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email) or len(email) > 254:
+        flash("Enter a valid email address for OTP and password recovery.", "error")
         return redirect(url_for("admin_users"))
     db = get_db()
     timestamp = now()
     try:
         cursor = db.execute("""
-            INSERT INTO users(username,password_hash,role,institution,is_active,created_at,updated_at)
-            VALUES(?,?,?,?,1,?,?)
+            INSERT INTO users(username,password_hash,role,institution,is_active,created_at,updated_at,email)
+            VALUES(?,?,?,?,1,?,?,?)
         """, (username, generate_password_hash(password), role,
-              session.get("institution"), timestamp, timestamp))
+              session.get("institution"), timestamp, timestamp, email))
         record_event(session.get("institution"), session.get("username"),
                      "account.created", "user", str(cursor.lastrowid),
                      {"username": username, "role": role})
@@ -749,6 +996,12 @@ def inject_globals():
 # Dashboard
 # ---------------------------------------------------------
 
+@app.route("/demo")
+def demo_page():
+    """Temporary browser-only demo using synthetic records; never writes to the database."""
+    return render_template("demo.html")
+
+
 @app.route("/")
 @login_required
 @role_required("institution_admin", "operator", "verifier", "auditor")
@@ -799,9 +1052,24 @@ def dashboard():
             FROM duplicate_candidates WHERE institution_id=? AND status='pending_review'""", (institution,))
             for value in row}
         quality_rows = db.execute("SELECT * FROM students WHERE institution=? AND archived_at IS NULL", (institution,)).fetchall()
-        quality_issues = sum(bool(validate_student_record(
-            dict(row), potential_duplicate=row["id"] in candidate_student_ids
-        )) for row in quality_rows)
+        unresolved_comparison_ids = {row[0] for row in db.execute("""SELECT DISTINCT student_id
+            FROM workflow_cases WHERE institution_id=? AND case_type='institution_source_comparison'
+            AND status IN ('open','in_review','waiting_for_evidence','escalated')""", (institution,))}
+        readiness_scores = []
+        quality_issue_count = 0
+        for row in quality_rows:
+            record = dict(row)
+            pending_duplicate = row["id"] in candidate_student_ids
+            issues = validate_student_record(record, potential_duplicate=pending_duplicate)
+            quality_issue_count += bool(issues)
+            readiness_scores.append(score_student_readiness(
+                record, issues, pending_duplicate=pending_duplicate,
+                unresolved_discrepancy=(record["status"] == "Discrepancy detected"
+                                        or row["id"] in unresolved_comparison_ids),
+            )["score"])
+        quality_issues = quality_issue_count
+        average_readiness = round(sum(readiness_scores) / len(readiness_scores)) if readiness_scores else 0
+        low_readiness = sum(score < 70 for score in readiness_scores)
         status_distribution = db.execute("""SELECT status,COUNT(*) AS count FROM students
             WHERE institution=? AND archived_at IS NULL GROUP BY status ORDER BY count DESC,status""",
             (institution,)).fetchall()
@@ -849,6 +1117,8 @@ def dashboard():
         duplicate_reviews=duplicate_reviews,
         pending_imports=pending_imports,
         quality_issues=quality_issues,
+        average_readiness=average_readiness,
+        low_readiness=low_readiness,
         status_distribution=status_distribution,
         case_age_distribution=case_age_distribution,
         recent_imports=recent_imports,
@@ -873,7 +1143,12 @@ def students():
         page = max(1, int(request.args.get("page", "1")))
     except ValueError:
         page = 1
-    per_page = 50
+    try:
+        per_page = int(request.args.get("per_page", "50"))
+    except ValueError:
+        per_page = 50
+    if per_page not in (25, 50, 100):
+        per_page = 50
     where = " WHERE institution=? AND archived_at IS NULL"
     args = [session.get("institution")]
 
@@ -900,19 +1175,53 @@ def students():
         where += " AND semester=?"
         args.append(semester)
 
+    qualified_where = (where.replace("institution=?", "s.institution=?")
+        .replace("archived_at IS NULL", "s.archived_at IS NULL")
+        .replace("full_name LIKE", "s.full_name LIKE")
+        .replace("institution_student_id LIKE", "s.institution_student_id LIKE")
+        .replace("institution LIKE", "s.institution LIKE")
+        .replace("course LIKE", "s.course LIKE")
+        .replace("status=?", "s.status=?")
+        .replace("course=?", "s.course=?")
+        .replace("semester=?", "s.semester=?"))
     with connect_db() as db:
         institution = session.get("institution")
         total_count = db.execute("SELECT COUNT(*) FROM students" + where, args).fetchone()[0]
         pages = max(1, (total_count + per_page - 1) // per_page)
         page = min(page, pages)
-        rows = db.execute("SELECT * FROM students" + where + " ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+        rows = db.execute("""SELECT s.*,
+            EXISTS(SELECT 1 FROM duplicate_candidates d WHERE d.institution_id=s.institution
+                AND d.status='pending_review' AND (d.student_a_id=s.id OR d.student_b_id=s.id)) AS pending_duplicate,
+            EXISTS(SELECT 1 FROM workflow_cases c WHERE c.institution_id=s.institution
+                AND c.student_id=s.id AND c.case_type='institution_source_comparison'
+                AND c.status IN ('open','in_review','waiting_for_evidence','escalated')) AS unresolved_comparison,
+            EXISTS(SELECT 1 FROM students other WHERE other.institution=s.institution
+                AND other.archived_at IS NULL AND other.id<>s.id
+                AND lower(other.institution_student_id)=lower(s.institution_student_id)) AS duplicate_code
+            FROM students s""" + qualified_where +
+            " ORDER BY s.updated_at DESC LIMIT ? OFFSET ?",
             [*args, per_page, (page - 1) * per_page]).fetchall()
         courses = [row[0] for row in db.execute("SELECT DISTINCT course FROM students WHERE institution=? AND archived_at IS NULL AND trim(course)<>'' ORDER BY course", (institution,))]
         semesters = [row[0] for row in db.execute("SELECT DISTINCT semester FROM students WHERE institution=? AND archived_at IS NULL AND trim(semester)<>'' ORDER BY semester", (institution,))]
 
+    students_with_readiness = []
+    for row in rows:
+        row_data = dict(row)
+        quality = validate_student_record(
+            row_data, duplicate_code=bool(row["duplicate_code"]),
+            potential_duplicate=bool(row["pending_duplicate"]),
+        )
+        row_data["readiness"] = score_student_readiness(
+            row_data, quality,
+            pending_duplicate=bool(row["pending_duplicate"]),
+            unresolved_discrepancy=(row_data["status"] == "Discrepancy detected"
+                                    or bool(row["unresolved_comparison"])),
+        )
+        students_with_readiness.append(row_data)
+
     return render_template(
         "students.html",
-        students=rows,
+        students=students_with_readiness,
         q=q,
         status=status,
         course=course,
@@ -921,6 +1230,7 @@ def students():
         semesters=semesters,
         page=page,
         pages=pages,
+        per_page=per_page,
         total_count=total_count,
     )
 
@@ -1092,6 +1402,16 @@ def student_detail(student_id):
         AND (student_a_id=? OR student_b_id=?) LIMIT 1""",
         (session.get("institution"), student_id, student_id)).fetchone() is not None
     quality_issues = validate_student_record(dict(student), potential_duplicate=possible_duplicate)
+    unresolved_discrepancy = student["status"] == "Discrepancy detected" or any(
+        case["case_type"] == "institution_source_comparison"
+        and case["status"] in {"open", "in_review", "waiting_for_evidence", "escalated"}
+        for case in cases
+    )
+    readiness = score_student_readiness(
+        dict(student), quality_issues,
+        pending_duplicate=possible_duplicate,
+        unresolved_discrepancy=unresolved_discrepancy,
+    )
     duplicate_records = db.execute("""SELECT c.id,c.status,c.score,c.decision_by,c.decided_at,
         CASE WHEN c.student_a_id=? THEN b.id ELSE a.id END AS other_student_id,
         CASE WHEN c.student_a_id=? THEN b.institution_student_id ELSE a.institution_student_id END AS other_student_code
@@ -1108,6 +1428,7 @@ def student_detail(student_id):
         cases=cases,
         verification_result=verification_result,
         quality_issues=quality_issues,
+        readiness=readiness,
         duplicate_records=duplicate_records,
         can_edit=session.get("role") in {"admin", "institution_admin", "operator"},
         can_validate=session.get("role") in {"admin", "institution_admin", "operator", "verifier"},
@@ -1565,13 +1886,54 @@ def imports():
             flash("This file was already reviewed. Its existing preview or import result is shown.", "success")
             return redirect(url_for("imports", job_id=old_job["id"]))
         try:
-            reader = csv.DictReader(io.StringIO(raw.decode("utf-8-sig"), newline=""))
+            csv_text = raw.decode("utf-8-sig", errors="strict")
+            reader = csv.DictReader(io.StringIO(csv_text, newline=""), strict=True)
+            raw_headers = reader.fieldnames or []
         except UnicodeDecodeError:
-            flash("CSV must use UTF-8 encoding.", "error")
+            flash("CSV must use UTF-8 encoding. Save the file as UTF-8 and try again.", "error")
             return redirect(url_for("imports"))
-        headers_found = {str(h or "").strip() for h in (reader.fieldnames or [])}
-        if not {"institution_student_id", "full_name"}.issubset(headers_found):
-            flash("CSV must include institution_student_id and full_name columns.", "error")
+        except csv.Error:
+            flash("CSV header is malformed. Check the file and try again.", "error")
+            return redirect(url_for("imports"))
+
+        # Map common CSV header variants to canonical app fields.
+        def _header_key(value):
+            return "".join(ch for ch in str(value or "").strip().casefold() if ch.isalnum())
+
+        _aliases = {
+            "institution_student_id": {"institutionstudentid", "studentid", "studentcode", "institutionalstudentid", "rollnumber", "rollno", "enrollmentnumber", "enrolmentnumber", "registrationnumber", "regno"},
+            "full_name": {"fullname", "studentname", "name", "nameofstudent", "learnername"},
+            "course": {"course", "program", "programme", "degree", "courseprogram"},
+            "semester": {"semester", "term", "yearsemester", "currentsemester"},
+            "apaar_id": {"apaarid", "apaaridentifier"},
+            "email": {"email", "emailaddress", "studentemail", "mail"},
+            "notes": {"notes", "comments", "remarks", "remark"},
+        }
+        _canonical_headers = {}
+        _duplicate_header_keys = set()
+        for _header in raw_headers:
+            _key = _header_key(_header)
+            if not _key:
+                continue
+            if _key in _canonical_headers:
+                _duplicate_header_keys.add(_key)
+            _canonical_headers[_key] = _header
+        if _duplicate_header_keys:
+            flash("CSV has duplicate column headers after normalization. Rename duplicate columns and upload again.", "error")
+            return redirect(url_for("imports"))
+
+        _header_map = {}
+        for _canonical, _names in _aliases.items():
+            _matches = [h for h in raw_headers if _header_key(h) in _names]
+            if len(_matches) > 1:
+                flash(f"Multiple CSV columns appear to map to {_canonical}. Keep only one matching column and upload again.", "error")
+                return redirect(url_for("imports"))
+            if _matches:
+                _header_map[_canonical] = _matches[0]
+        _missing = [field for field in ("institution_student_id", "full_name") if field not in _header_map]
+        if _missing:
+            flash("Could not identify required columns: " + ", ".join(_missing) +
+                  ". Try headers such as student_id / roll_no and name / student_name.", "error")
             return redirect(url_for("imports"))
         job_id, created_at, parsed, seen = secrets.token_hex(16), now(), [], set()
         accepted = rejected = 0
@@ -1580,7 +1942,12 @@ def imports():
             names = {" ".join((r[0] or "").casefold().split()) for r in db.execute("SELECT full_name FROM students WHERE institution=? AND archived_at IS NULL", (institution,))}
             emails = {str(r[0]).casefold().strip() for r in db.execute("SELECT email FROM students WHERE institution=? AND archived_at IS NULL AND email<>''", (institution,))}
             for line_number, raw_row in enumerate(reader, start=2):
-                row = {str(k or "").strip(): str(v or "").strip() for k, v in raw_row.items() if k is not None}
+                # Reject rows with extra or missing cells instead of silently misreading them.
+                malformed_width = None in raw_row or any(value is None for value in raw_row.values())
+                row = {}
+                for canonical, source_header in _header_map.items():
+                    value = raw_row.get(source_header, "")
+                    row[canonical] = str(value or "").strip() if value is not None else ""
                 code, name = row.get("institution_student_id", ""), row.get("full_name", "")
                 course, semester = row.get("course", ""), row.get("semester", "")
                 apaar_id, email, notes = row.get("apaar_id", ""), row.get("email", ""), row.get("notes", "")
@@ -1600,6 +1967,8 @@ def imports():
                           for item in quality_issues if item["severity"] == "error"]
                 warnings = [f"[{item['code']}] {item['message']} Next step: {item['next_action']}"
                             for item in quality_issues if item["severity"] == "warning"]
+                if malformed_width:
+                    errors.append("[malformed_column_count] This row has a different number of cells than the header. Correct the CSV row and re-upload.")
                 valid = int(not errors)
                 accepted += valid
                 rejected += 1 - valid
@@ -1781,3 +2150,4 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", "5000")),
         debug=os.environ.get("FLASK_DEBUG", "0") == "1",
     )
+
