@@ -8,11 +8,14 @@
  <link rel="stylesheet" href="{{ url_for('static', filename='design-system.css') }}">
 </head>
 <body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
 {% if session.get('username') %}
 <div class="shell">
  <aside class="sidebar">
  <a class="brand" href="{{ url_for('dashboard') }}"><span class="brand-mark">A</span><span><strong>APAAR Verify</strong><small>Student data platform</small></span></a>
  <div class="nav-label">WORKSPACE</div>
+ <a class="nav-link {% if request.endpoint=='help_page' %}active{% endif %}" href="{{ url_for('help_page') }}">Help &amp; user guide</a>
+ <a class="nav-link {% if request.endpoint in ['account_security','verify_email'] %}active{% endif %}" href="{{ url_for('account_security') }}">Account security</a>
  <a class="nav-link {% if request.endpoint=='apaar_api.review_queue' %}active{% endif %}" href="{{ url_for('apaar_api.review_queue') }}"><span>Review queue</span></a>
  <a class="nav-link {% if request.endpoint=='dashboard' %}active{% endif %}" href="{{ url_for('dashboard') }}"> <span>Overview</span></a>
  <a class="nav-link {% if request.endpoint in ['students','student_form','student_detail'] %}active{% endif %}" href="{{ url_for('students') }}"> <span>Students</span></a>
@@ -23,7 +26,7 @@
  {% if session.get('role') in ['admin','institution_admin'] %}<a class="nav-link" href="{{ url_for('archived_students') }}"><span>Archived records</span></a>{% endif %}
  <div class="sidebar-bottom"><div class="demo-note"><strong>Demo environment</strong><p>Synthetic data | No official APAAR connection</p></div><div class="user-row"><span class="avatar">{{ session.get('username','U')[0]|upper }}</span><div><strong>{{ session.get('username') }}</strong><small>Application user</small></div><form method="post" action="{{ url_for('logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="logout" title="Log out">Log out</button></form></div></div>
  </aside>
- <main class="main">
+ <main class="main" id="main-content" tabindex="-1">
  <header class="topbar"><div><span class="eyebrow">SIH 2026 | SIH26263</span><strong>Student Data Management &amp; Verification</strong></div><span class="demo-pill"><i></i> Prototype mode</span></header>
  <section class="content">
  {% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}<div class="flashes">{% for category,message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}</div>{% endif %}{% endwith %}
@@ -33,7 +36,9 @@
  </main>
 </div>
 {% else %}
+<main id="main-content" tabindex="-1">
 {% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}<div class="login-flashes">{% for category,message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}</div>{% endif %}{% endwith %}
 {% block public_content %}{% endblock %}
+ </main>
 {% endif %}
 </body></html>

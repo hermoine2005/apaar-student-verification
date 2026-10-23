@@ -1,0 +1,212 @@
+﻿{% extends "base.html" %}
+{% block content %}
+<style>
+.demo-wrap{max-width:1150px;margin:0 auto;padding:20px}
+.demo-banner{padding:14px 16px;border:1px solid #d6a84f;border-radius:10px;background:#fff8e7;color:#704b00;margin:14px 0 22px}
+.demo-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px;margin:18px 0}
+.demo-card{border:1px solid var(--border,#ddd);border-radius:12px;padding:16px;background:var(--surface,#fff)}
+.demo-card h3{margin-top:0}
+.demo-form{display:flex;gap:10px;flex-wrap:wrap;margin:12px 0}
+.demo-form input,.demo-form select,.demo-form button,.demo-form textarea{padding:10px;border:1px solid #bbb;border-radius:7px;font:inherit}
+.demo-form input{flex:1;min-width:150px}
+.demo-button{cursor:pointer;border:0!important;background:#174ea6;color:white;padding:10px 14px!important;border-radius:7px}
+.demo-table-wrap{overflow-x:auto}
+.demo-table{width:100%;border-collapse:collapse;margin-top:12px}
+.demo-table th,.demo-table td{padding:10px;text-align:left;border-bottom:1px solid #ddd}
+.demo-pill{display:inline-block;border-radius:20px;padding:4px 9px;background:#eee;font-size:.85em}
+.demo-good{background:#e0f4e7;color:#176337}
+.demo-pending{background:#fff0cc;color:#785500}
+.demo-muted{color:#666;font-size:.92em}
+.demo-output{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;background:var(--surface,#f6f6f6);border-radius:8px}
+</style>
+
+<div class="demo-wrap">
+  <h1>APAAR Verify — Interactive Demo</h1>
+  <p>Explore the student data workflow using sample records.</p>
+
+  <div class="demo-banner">
+    <strong>Temporary learning demo.</strong>
+    All records on this page exist only in your browser memory.
+    Actions here do not write to the application database and do not contact
+    APAAR, DigiLocker, or any government service.
+  </div>
+
+  <div class="demo-grid">
+    <section class="demo-card">
+      <h3>1. Student records</h3>
+      <p class="demo-muted">Add a synthetic student and explore the record list.</p>
+      <strong id="demo-total">3</strong> demo records
+    </section>
+    <section class="demo-card">
+      <h3>2. Verification</h3>
+      <p class="demo-muted">Try changing a sample record's review status.</p>
+      <strong id="demo-verified">1</strong> marked reviewed
+    </section>
+    <section class="demo-card">
+      <h3>3. Data quality</h3>
+      <p class="demo-muted">Use the CSV preview to understand import preparation.</p>
+      <strong>Preview only</strong>
+    </section>
+  </div>
+
+  <section class="demo-card">
+    <h2>Add a sample student</h2>
+    <form id="demo-add-form" class="demo-form">
+      <input id="demo-student-id" placeholder="Student ID (e.g. DEMO-004)" required maxlength="40">
+      <input id="demo-name" placeholder="Student full name" required maxlength="100">
+      <input id="demo-course" placeholder="Course" value="Engineering" maxlength="100">
+      <button class="demo-button" type="submit">Add to demo</button>
+    </form>
+    <p id="demo-message" class="demo-muted" aria-live="polite"></p>
+  </section>
+
+  <section class="demo-card" style="margin-top:16px">
+    <h2>Sample student register</h2>
+    <div class="demo-form">
+      <input id="demo-search" placeholder="Search ID, name, or course">
+      <select id="demo-filter" aria-label="Filter by review status">
+        <option value="all">All statuses</option>
+        <option value="pending">Pending review</option>
+        <option value="reviewed">Reviewed (demo only)</option>
+      </select>
+      <button id="demo-reset" class="demo-button" type="button">Reset demo data</button>
+    </div>
+    <div class="demo-table-wrap">
+      <table class="demo-table">
+        <thead><tr><th>Student ID</th><th>Name</th><th>Course</th><th>Status</th><th>Action</th></tr></thead>
+        <tbody id="demo-rows"></tbody>
+      </table>
+    </div>
+    <p class="demo-muted">“Mark reviewed” simulates a user-interface action only. It is not an official verification result.</p>
+  </section>
+
+  <section class="demo-card" style="margin-top:16px">
+    <h2>CSV import preview</h2>
+    <p class="demo-muted">Choose a CSV file to preview its first rows. This does not import or save anything.</p>
+    <p><a href="data:text/csv;charset=utf-8,institution_student_id%2Cfull_name%2Ccourse%2Csemester%0ADEMO-101%2CSample%20Student%2CEngineering%2C1%0ADEMO-102%2CAnother%20Student%2CScience%2C2" download="sample-students.csv">Download sample CSV</a></p>
+    <div class="demo-form">
+      <input type="file" id="demo-csv" accept=".csv,text/csv">
+    </div>
+    <div id="demo-csv-output" class="demo-output">No file selected.</div>
+  </section>
+
+  <section class="demo-card" style="margin-top:16px">
+    <h2>Explore the real application</h2>
+    <p>These links leave the browser-only demo and open your existing application pages.</p>
+    <p><a href="/students">Student register</a> ·
+       <a href="/imports">CSV imports</a> ·
+       <a href="/source-datasets">Institution source datasets</a> ·
+       <a href="/audit">Audit log</a></p>
+  </section>
+</div>
+
+<script>
+(() => {
+  const initial = [
+    {id:"DEMO-001",name:"Aarav Sharma",course:"Engineering",reviewed:true},
+    {id:"DEMO-002",name:"Isha Patil",course:"Computer Science",reviewed:false},
+    {id:"DEMO-003",name:"Kabir Joshi",course:"Science",reviewed:false}
+  ];
+  let records = initial.map(x => ({...x}));
+  const rows = document.getElementById("demo-rows");
+  const message = document.getElementById("demo-message");
+
+  function el(tag, text) {
+    const node = document.createElement(tag);
+    node.textContent = text;
+    return node;
+  }
+
+  function render() {
+    const search = document.getElementById("demo-search").value.trim().toLowerCase();
+    const filter = document.getElementById("demo-filter").value;
+    rows.replaceChildren();
+
+    records.filter(r => {
+      const matches = [r.id, r.name, r.course].some(v => v.toLowerCase().includes(search));
+      return matches && (filter === "all" ||
+        (filter === "reviewed" && r.reviewed) ||
+        (filter === "pending" && !r.reviewed));
+    }).forEach(r => {
+      const tr = document.createElement("tr");
+      [r.id, r.name, r.course].forEach(value => tr.appendChild(el("td", value)));
+
+      const statusCell = document.createElement("td");
+      const pill = el("span", r.reviewed ? "Reviewed (demo)" : "Pending review");
+      pill.className = "demo-pill " + (r.reviewed ? "demo-good" : "demo-pending");
+      statusCell.appendChild(pill);
+      tr.appendChild(statusCell);
+
+      const actionCell = document.createElement("td");
+      const button = el("button", r.reviewed ? "Return to pending" : "Mark reviewed");
+      button.type = "button";
+      button.className = "demo-button";
+      button.addEventListener("click", () => {
+        r.reviewed = !r.reviewed;
+        message.textContent = "Demo status changed for " + r.id + ". No database was changed.";
+        render();
+      });
+      actionCell.appendChild(button);
+      tr.appendChild(actionCell);
+      rows.appendChild(tr);
+    });
+
+    document.getElementById("demo-total").textContent = records.length;
+    document.getElementById("demo-verified").textContent = records.filter(r => r.reviewed).length;
+  }
+
+  document.getElementById("demo-add-form").addEventListener("submit", event => {
+    event.preventDefault();
+    const id = document.getElementById("demo-student-id").value.trim();
+    const name = document.getElementById("demo-name").value.trim();
+    const course = document.getElementById("demo-course").value.trim() || "Not specified";
+
+    if (!id || !name) {
+      message.textContent = "Enter both a student ID and a name.";
+      return;
+    }
+    if (records.some(r => r.id.toLowerCase() === id.toLowerCase())) {
+      message.textContent = "That demo student ID already exists.";
+      return;
+    }
+    records.push({id, name, course, reviewed:false});
+    event.target.reset();
+    document.getElementById("demo-course").value = "Engineering";
+    message.textContent = "Added " + id + " to temporary demo memory only.";
+    render();
+  });
+
+  document.getElementById("demo-search").addEventListener("input", render);
+  document.getElementById("demo-filter").addEventListener("change", render);
+  document.getElementById("demo-reset").addEventListener("click", () => {
+    records = initial.map(x => ({...x}));
+    message.textContent = "Demo records reset. No database was changed.";
+    render();
+  });
+
+  document.getElementById("demo-csv").addEventListener("change", event => {
+    const file = event.target.files && event.target.files[0];
+    const output = document.getElementById("demo-csv-output");
+    if (!file) {
+      output.textContent = "No file selected.";
+      return;
+    }
+    if (file.size > 1024 * 1024) {
+      output.textContent = "Choose a CSV smaller than 1 MB for this demo.";
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const lines = String(reader.result || "").split(/\r?\n/).filter(line => line.trim());
+      output.textContent = lines.slice(0, 7).join("\n") +
+        (lines.length > 7 ? "\n… preview limited to first 7 rows." : "") +
+        "\n\nPreview only. Nothing was uploaded or saved.";
+    };
+    reader.onerror = () => { output.textContent = "The selected file could not be read."; };
+    reader.readAsText(file);
+  });
+
+  render();
+})();
+</script>
+{% endblock %}

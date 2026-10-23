@@ -2,9 +2,130 @@
 {% block title %}Import records{% endblock %}
 {% block content %}
 <div class="page-heading"><div><span class="eyebrow">DATA OPERATIONS</span><h1>Import student records</h1><p>Preview and validate rows before a single transactional commit.</p></div><a class="btn secondary" href="{{ url_for('export_students') }}">Export existing data</a></div>
-<div class="notice"><span class="notice-icon">i</span><div><strong>Synthetic data only</strong><p>UTF-8 CSV, maximum 2 MB. Institution membership comes from your signed-in account; any CSV institution column is ignored.</p></div></div>
-<div class="import-grid"><div class="panel"><div class="panel-heading"><div><h2>Upload CSV file</h2><p>Required: institution_student_id, full_name</p></div></div>{% if session.get('role') in ['admin','institution_admin','operator'] %}<form method="post" enctype="multipart/form-data" class="upload-form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><label class="drop-zone"><span class="upload-icon" aria-hidden="true">CSV</span><strong>Select a CSV file</strong><span>UTF-8 | Maximum 2 MB</span><input type="file" name="file" accept=".csv,text/csv" required></label><button class="btn primary full" type="submit">Upload and preview</button></form>{% else %}<p class="task-empty">This account can review import history but cannot create or confirm imports.</p>{% endif %}</div><div class="panel"><div class="panel-heading"><div><h2>Supported columns</h2><p>Institution value is always server supplied</p></div></div><div class="column-list"><div><span class="required-dot">*</span><code>institution_student_id</code></div><div><span class="required-dot">*</span><code>full_name</code></div>{% for col in ['course','semester','apaar_id','email','notes'] %}<div><span class="optional-dot">?</span><code>{{ col }}</code><small>Optional</small></div>{% endfor %}</div><a class="text-link" href="{{ url_for('static',filename='sample_students.csv') }}" download>Download synthetic sample CSV</a></div></div>
-{% if report %}<div class="panel result-panel"><div class="panel-heading"><div><h2>Import preview</h2><p>{{ report.job.file_name }} | created {{ report.job.created_at[:19].replace('T',' ') }} UTC</p></div><span class="status {{ 'demo-validated' if report.job.status=='committed' else 'pending' }}">{{ report.job.status|title }}</span></div><div class="import-result-stats"><div><strong>{{ report.total_rows }}</strong><span>Total data rows</span></div><div><strong>{{ report.job.accepted_count }}</strong><span>Valid rows</span></div><div><strong>{{ report.job.rejected_count }}</strong><span>Rows with errors (rejected)</span></div><div><strong>{{ report.warning_rows }}</strong><span>Rows with warnings</span></div></div><div class="table-wrap"><table><thead><tr><th>CSV row</th><th>Institution ID</th><th>Student</th><th>Result</th><th>Validation</th></tr></thead><tbody>{% for row in report.rows %}<tr><td>{{ row.row_number }}</td><td class="mono">{{ row.student_code }}</td><td>{{ row.full_name }}</td><td><span class="status {{ 'demo-validated' if row.is_valid else 'needs-review' }}">{{ 'Ready' if row.is_valid else 'Rejected' }}</span></td><td>{% for error in row.errors %}<div class="error-text">{{ error }}</div>{% endfor %}{% for warning in row.warnings %}<div class="warning-text">{{ warning }}</div>{% endfor %}{% if not row.errors and not row.warnings %}<span class="muted">No local issues</span>{% endif %}</td></tr>{% else %}<tr><td colspan="5" class="empty">This file contains no data rows.</td></tr>{% endfor %}</tbody></table></div><div class="form-actions">{% if session.get('role') in ['admin','institution_admin','operator'] %}<a class="btn secondary" href="{{ url_for('import_errors',job_id=report.job.id) }}">Download error report</a>{% endif %}{% if report.job.status=='preview' %}<form method="post" action="{{ url_for('confirm_import',job_id=report.job.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="btn primary" type="submit" {% if report.job.accepted_count==0 %}disabled{% endif %}>Confirm {{ report.job.accepted_count }} valid rows</button></form>{% else %}<span class="status demo-validated">Committed {{ report.job.confirmed_at[:19].replace('T',' ') }} UTC</span>{% endif %}</div><div class="import-next-step"><strong>{% if report.job.status=='committed' %}Next: review the saved student records and any follow-up tasks.{% else %}Preview only: no student records have been written yet.{% endif %}</strong><div class="summary-actions"><a class="btn secondary" href="{{ url_for('students') }}">Open student directory</a><a class="btn secondary" href="{{ url_for('apaar_api.review_queue') }}">Open verification workbench</a></div></div><p class="table-foot">Confirmation commits all valid rows in one transaction. Rejected rows are skipped. Re-uploading identical file content opens this job instead of creating duplicate records.</p></div>{% endif %}
-<div class="panel"><div class="panel-heading"><div><h2>Import history</h2><p>Recent uploads for your institution</p></div></div><div class="table-wrap"><table><thead><tr><th>File</th><th>Status</th><th>Valid</th><th>Rejected</th><th>Warning rows</th><th>Created (UTC)</th><th></th></tr></thead><tbody>{% for job in history %}<tr><td>{{ job.file_name }}</td><td>{{ job.status|title }}</td><td>{{ job.accepted_count }}</td><td>{{ job.rejected_count }}</td><td>{{ job.warning_rows }}</td><td>{{ job.created_at[:19].replace('T',' ') }}</td><td><a class="text-link" href="{{ url_for('imports',job_id=job.id) }}">Open</a></td></tr>{% else %}<tr><td colspan="7" class="empty">No import history yet.</td></tr>{% endfor %}</tbody></table></div></div>
-{% endblock %}
+<div class="notice"><span class="notice-icon">i</span><div><strong>Synthetic data only</strong><p>UTF-8 CSV, maximum 2 MB and 10,000 data rows. Common column names are detected automatically. Institution membership comes from your signed-in account; any CSV institution column is ignored. Uploading creates a preview only; records are saved after confirmation.</p></div></div>
+<div class="import-grid"><div class="panel"><div class="panel-heading"><div><h2>Upload CSV file</h2><p>Required fields are detected from common header variants, including student_id / roll_no and name / student_name.</p></div></div>{% if session.get('role') in ['admin','institution_admin','operator'] %}<form method="post" enctype="multipart/form-data" class="upload-form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><label class="drop-zone"><span class="upload-icon" aria-hidden="true">CSV</span><strong>Select a CSV file</strong><span>UTF-8 CSV | Maximum 2 MB | Maximum 10,000 rows</span><input type="file" name="file" accept=".csv,text/csv" required></label><button class="btn primary full" type="submit">Upload and preview</button></form>{% else %}<p class="task-empty">This account can review import history but cannot create or confirm imports.</p>{% endif %}</div><div class="panel"><div class="panel-heading"><div><h2>Supported columns</h2><p>Institution value is always server supplied</p></div></div><div class="column-list"><div><span class="required-dot">*</span><code>institution_student_id</code></div><div><span class="required-dot">*</span><code>full_name</code></div>{% for col in ['course','semester','apaar_id','email','notes'] %}<div><span class="optional-dot">?</span><code>{{ col }}</code><small>Optional</small></div>{% endfor %}</div><a class="text-link" href="{{ url_for('static',filename='sample_students.csv') }}" download>Download synthetic sample CSV</a></div></div>
+{% if report %}<div class="panel result-panel"><div class="panel-heading"><div><h2>Import preview</h2><p>{{ report.job.file_name }} | created {{ report.job.created_at[:19].replace('T',' ') }} UTC</p></div><span class="status {{ 'demo-validated' if report.job.status=='committed' else 'pending' }}">{{ report.job.status|title }}</span></div><div class="smart-import-summary">
+  <strong>Smart import preview</strong>
+  <p>Required fields were detected automatically. Review row-level results before confirming the import.</p>
+  <div class="smart-import-steps"><span class="step-done">1. Upload</span><span class="step-done">2. Detect columns</span><span class="step-current">3. Validate preview</span><span>4. Confirm import</span></div>
+</div>
+<div class="import-result-stats import-metric-filters" aria-label="Filter preview rows">
+<button type="button" class="import-metric is-active" data-row-filter="all" aria-pressed="true"><strong>{{ report.total_rows }}</strong><span>Total data rows</span></button>
+<button type="button" class="import-metric" data-row-filter="valid" aria-pressed="false"><strong>{{ report.job.accepted_count }}</strong><span>Valid rows</span></button>
+<button type="button" class="import-metric" data-row-filter="rejected" aria-pressed="false"><strong>{{ report.job.rejected_count }}</strong><span>Rows with errors (rejected)</span></button>
+<button type="button" class="import-metric" data-row-filter="warning" aria-pressed="false"><strong>{{ report.warning_rows }}</strong><span>Rows with warnings</span></button>
+</div>
+<div class="import-table-tools">
+<label class="import-search-label">Search preview<input type="search" id="importPreviewSearch" placeholder="Search ID, student, error or warning..." autocomplete="off"></label>
+<label class="import-filter-label">Result<select id="importPreviewStatus"><option value="all">All results</option><option value="valid">Ready</option><option value="rejected">Rejected</option><option value="warning">Has warnings</option></select></label>
+<button type="button" class="btn secondary" id="clearImportFilters">Clear filters</button><span id="importPreviewCount" class="muted" aria-live="polite"></span></div>
+<div class="table-wrap"><table id="importPreviewTable"><thead><tr><th><button type="button" class="table-sort" data-sort-col="0">CSV row (sort)</button></th><th><button type="button" class="table-sort" data-sort-col="1">Institution ID (sort)</button></th><th><button type="button" class="table-sort" data-sort-col="2">Student (sort)</button></th><th><button type="button" class="table-sort" data-sort-col="3">Result (sort)</button></th><th>Validation</th></tr></thead><tbody>{% for row in report.rows %}<tr data-result="{{ 'valid' if row.is_valid else 'rejected' }}" data-warning="{{ 'yes' if row.warnings else 'no' }}"><td data-sort-value="{{ row.row_number }}">{{ row.row_number }}</td><td class="mono">{{ row.student_code }}</td><td>{{ row.full_name }}</td><td><span class="status {{ 'demo-validated' if row.is_valid else 'needs-review' }}">{{ 'Ready' if row.is_valid else 'Rejected' }}</span></td><td>{% for error in row.errors %}<div class="error-text">{{ error }}</div>{% endfor %}{% for warning in row.warnings %}<div class="warning-text">{{ warning }}</div>{% endfor %}{% if not row.errors and not row.warnings %}<span class="muted">No local issues</span>{% endif %}</td></tr>{% else %}<tr><td colspan="5" class="empty">This file contains no data rows.</td></tr>{% endfor %}</tbody></table></div><div class="form-actions">{% if session.get('role') in ['admin','institution_admin','operator'] %}<a class="btn secondary" href="{{ url_for('import_errors',job_id=report.job.id) }}">Download error report</a>{% endif %}{% if report.job.status=='preview' %}<form method="post" action="{{ url_for('confirm_import',job_id=report.job.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="btn primary" type="submit" {% if report.job.accepted_count==0 %}disabled{% endif %}>Confirm {{ report.job.accepted_count }} valid rows</button></form>{% else %}<span class="status demo-validated">Committed {{ report.job.confirmed_at[:19].replace('T',' ') }} UTC</span>{% endif %}</div><div class="import-next-step"><strong>{% if report.job.status=='committed' %}Next: review the saved student records and any follow-up tasks.{% else %}Preview only: no student records have been written yet.{% endif %}</strong><div class="summary-actions"><a class="btn secondary" href="{{ url_for('students') }}">Open student directory</a><a class="btn secondary" href="{{ url_for('apaar_api.review_queue') }}">Open verification workbench</a></div></div><p class="table-foot">Confirmation commits all valid rows in one transaction. Rejected rows are skipped. Re-uploading identical file content opens this job instead of creating duplicate records.</p></div>{% endif %}
+<div class="panel import-history-panel"><div class="panel-heading"><div><h2>Import history</h2><p>Recent uploads for your institution</p></div></div>
+<div class="import-table-tools"><label class="import-search-label">Search import history<input type="search" id="importHistorySearch" placeholder="Search filename or status..." autocomplete="off"></label><label class="import-filter-label">Category<select id="importHistoryStatus"><option value="all">All imports</option><option value="preview">Preview</option><option value="committed">Committed</option></select></label><span id="importHistoryCount" class="muted" aria-live="polite"></span></div>
+<div class="table-wrap"><table id="importHistoryTable"><thead><tr><th><button type="button" class="table-sort" data-sort-col="0">File (sort)</button></th><th><button type="button" class="table-sort" data-sort-col="1">Status (sort)</button></th><th><button type="button" class="table-sort" data-sort-col="2">Valid (sort)</button></th><th><button type="button" class="table-sort" data-sort-col="3">Rejected (sort)</button></th><th><button type="button" class="table-sort" data-sort-col="4">Warning rows (sort)</button></th><th><button type="button" class="table-sort" data-sort-col="5">Created (UTC) (sort)</button></th><th></th></tr></thead><tbody>{% for job in history %}<tr data-status="{{ job.status }}"><td>{{ job.file_name }}</td><td>{{ job.status|title }}</td><td>{{ job.accepted_count }}</td><td>{{ job.rejected_count }}</td><td>{{ job.warning_rows }}</td><td>{{ job.created_at[:19].replace('T',' ') }}</td><td><a class="text-link" href="{{ url_for('imports',job_id=job.id) }}">Open</a></td></tr>{% else %}<tr><td colspan="7" class="empty">No import history yet.</td></tr>{% endfor %}</tbody></table></div></div>
 
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+  function rowsFor(table) {
+    return table && table.tBodies.length
+      ? Array.from(table.tBodies[0].rows).filter(function (row) { return !row.querySelector(".empty"); })
+      : [];
+  }
+  function sortTable(table) {
+    if (!table) return;
+    table.querySelectorAll("[data-sort-col]").forEach(function (button) {
+      button.setAttribute("aria-label", "Sort by " + button.textContent.trim());
+      button.addEventListener("click", function () {
+        var column = Number(button.dataset.sortCol);
+        var ascending = button.dataset.sortDir !== "asc";
+        table.querySelectorAll("[data-sort-col]").forEach(function (item) {
+          delete item.dataset.sortDir;
+          item.setAttribute("aria-sort", "none");
+        });
+        button.dataset.sortDir = ascending ? "asc" : "desc";
+        button.setAttribute("aria-sort", ascending ? "ascending" : "descending");
+        rowsFor(table).sort(function (a, b) {
+          var av = ((a.cells[column] && (a.cells[column].dataset.sortValue || a.cells[column].textContent)) || "").trim();
+          var bv = ((b.cells[column] && (b.cells[column].dataset.sortValue || b.cells[column].textContent)) || "").trim();
+          var an = Number(av), bn = Number(bv);
+          var numeric = av !== "" && bv !== "" && Number.isFinite(an) && Number.isFinite(bn);
+          var order = numeric ? an - bn : av.localeCompare(bv, undefined, {numeric: true, sensitivity: "base"});
+          return ascending ? order : -order;
+        }).forEach(function (row) { table.tBodies[0].appendChild(row); });
+      });
+    });
+  }
+
+  var preview = document.getElementById("importPreviewTable");
+  var previewSearch = document.getElementById("importPreviewSearch");
+  var previewStatus = document.getElementById("importPreviewStatus");
+  var previewCount = document.getElementById("importPreviewCount");
+  var metricButtons = Array.from(document.querySelectorAll("[data-row-filter]"));
+  if (preview && previewSearch && previewStatus && previewCount) {
+    var previewRows = rowsFor(preview);
+    var activeCategory = "all";
+    function filterPreview() {
+      var term = previewSearch.value.trim().toLocaleLowerCase();
+      var category = activeCategory === "all" ? previewStatus.value : activeCategory;
+      var visible = 0;
+      previewRows.forEach(function (row) {
+        var matchesText = !term || row.textContent.toLocaleLowerCase().includes(term);
+        var matchesCategory = category === "all" || row.dataset.result === category ||
+          (category === "warning" && row.dataset.warning === "yes");
+        row.hidden = !(matchesText && matchesCategory);
+        if (!row.hidden) visible++;
+      });
+      previewCount.textContent = "Showing " + visible + " of " + previewRows.length + " rows";
+    }
+    function selectCategory(category) {
+      activeCategory = category;
+      previewStatus.value = category;
+      metricButtons.forEach(function (button) {
+        var active = button.dataset.rowFilter === category;
+        button.classList.toggle("is-active", active);
+        button.setAttribute("aria-pressed", String(active));
+      });
+      filterPreview();
+    }
+    previewSearch.addEventListener("input", filterPreview);
+    previewStatus.addEventListener("change", function () { selectCategory(previewStatus.value); });
+    metricButtons.forEach(function (button) {
+      button.addEventListener("click", function () { selectCategory(button.dataset.rowFilter); });
+    });
+    document.getElementById("clearImportFilters").addEventListener("click", function () {
+      previewSearch.value = "";
+      selectCategory("all");
+      previewSearch.focus();
+    });
+    filterPreview();
+  }
+
+  var history = document.getElementById("importHistoryTable");
+  var historySearch = document.getElementById("importHistorySearch");
+  var historyStatus = document.getElementById("importHistoryStatus");
+  var historyCount = document.getElementById("importHistoryCount");
+  if (history && historySearch && historyStatus && historyCount) {
+    var historyRows = rowsFor(history);
+    function filterHistory() {
+      var term = historySearch.value.trim().toLocaleLowerCase();
+      var category = historyStatus.value;
+      var visible = 0;
+      historyRows.forEach(function (row) {
+        var matchesText = !term || row.textContent.toLocaleLowerCase().includes(term);
+        var matchesCategory = category === "all" || row.dataset.status === category;
+        row.hidden = !(matchesText && matchesCategory);
+        if (!row.hidden) visible++;
+      });
+      historyCount.textContent = "Showing " + visible + " of " + historyRows.length + " recent imports";
+    }
+    historySearch.addEventListener("input", filterHistory);
+    historyStatus.addEventListener("change", filterHistory);
+    filterHistory();
+  }
+  sortTable(preview);
+  sortTable(history);
+});
+</script>
+
+{% endblock %}
